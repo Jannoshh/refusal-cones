@@ -117,22 +117,19 @@ def analyze_layers(results_dir: Path, output_path: Path = None):
     # Panel 3: Layer direction similarity heatmap
     ax3 = axes[2]
 
-    # Compute cosine similarity between layer directions across vectors
-    layer_similarity = torch.zeros(n_layers, n_layers)
-    for i in range(n_layers):
-        for j in range(n_layers):
-            vi = vectors[:, i, :]  # [n_vectors, hidden_dim]
-            vj = vectors[:, j, :]
-            vi_norm = vi / (vi.norm(dim=1, keepdim=True) + 1e-8)
-            vj_norm = vj / (vj.norm(dim=1, keepdim=True) + 1e-8)
-            cos_sim = (vi_norm * vj_norm).sum(dim=1).mean()
-            layer_similarity[i, j] = cos_sim
+    # Pick the first vector and compute cosine sim between layer i and layer j
+    # This shows if adjacent layers have similar directions (layer smoothness)
+    v0 = vectors[0]  # [n_layers, hidden_dim] - first Pareto vector
+    v0_norm = v0 / (v0.norm(dim=1, keepdim=True) + 1e-8)  # [n_layers, hidden_dim]
+
+    # Compute pairwise cosine similarity: sim[i,j] = v0[i] · v0[j]
+    layer_similarity = v0_norm @ v0_norm.T  # [n_layers, n_layers]
 
     im = ax3.imshow(layer_similarity.numpy(), cmap='RdBu_r', vmin=-1, vmax=1)
-    ax3.set_xlabel("Layer")
-    ax3.set_ylabel("Layer")
-    ax3.set_title("Layer Direction Similarity\n(should show diagonal band if smooth)")
-    plt.colorbar(im, ax=ax3, label="Cosine Similarity")
+    ax3.set_xlabel("Layer j")
+    ax3.set_ylabel("Layer i")
+    ax3.set_title("Layer Direction Similarity (v1)\n(should show diagonal band if smooth)")
+    plt.colorbar(im, ax=ax3, label="cos(layer_i, layer_j)")
 
     plt.tight_layout()
 
@@ -158,14 +155,23 @@ def analyze_layers(results_dir: Path, output_path: Path = None):
     for i, l in enumerate(bottom_layers):
         print(f"  {i+1}. Layer {l}: {mean_norms[l]:.4f}")
 
-    # Check for layer smoothness
+    # Check for layer smoothness (using first vector)
+    # Adjacent layers should have high cosine similarity if GP enforces smoothness
     off_diag_sim = []
     for i in range(n_layers - 1):
         off_diag_sim.append(layer_similarity[i, i+1].item())
     mean_adjacent_sim = np.mean(off_diag_sim)
 
-    print(f"\nLayer smoothness:")
-    print(f"  Mean adjacent-layer similarity: {mean_adjacent_sim:.4f}")
+    # Also compute mean similarity at distance 2 and 3
+    dist2_sim = [layer_similarity[i, i+2].item() for i in range(n_layers - 2)]
+    dist3_sim = [layer_similarity[i, i+3].item() for i in range(n_layers - 3)]
+    mean_dist2_sim = np.mean(dist2_sim) if dist2_sim else 0
+    mean_dist3_sim = np.mean(dist3_sim) if dist3_sim else 0
+
+    print(f"\nLayer smoothness (first vector):")
+    print(f"  Adjacent (d=1): {mean_adjacent_sim:.4f}")
+    print(f"  Distance 2:     {mean_dist2_sim:.4f}")
+    print(f"  Distance 3:     {mean_dist3_sim:.4f}")
     if mean_adjacent_sim > 0.5:
         print("  ✓ Good layer smoothness (adjacent layers correlated)")
     elif mean_adjacent_sim > 0.2:
