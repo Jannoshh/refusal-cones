@@ -49,6 +49,7 @@ class GradientDiscoveryConfig:
     beta: float = 2.0
     new_mode_threshold: float = 0.7  # Min R to consider as mode
     mode_distance_threshold: float = 0.3  # Min distance between modes
+    kernel_type: str = 'rbf'
     kernel_lengthscale: float = 0.3
     use_sparse_gp: bool = False
     num_inducing: int = 64
@@ -207,7 +208,7 @@ class GradientGeometryDiscovery:
         # GP
         if self.config.use_sparse_gp:
             self.gp = AdaptiveSparseGP(
-                kernel_type='rbf',
+                kernel_type=self.config.kernel_type,
                 lengthscale=self.config.kernel_lengthscale,
                 num_inducing=self.config.num_inducing,
                 train_steps=self.config.sparse_train_steps,
@@ -216,7 +217,7 @@ class GradientGeometryDiscovery:
                 jitter=self.config.sparse_jitter
             )
         else:
-            self.gp = SimpleGP(kernel_type='rbf', lengthscale=self.config.kernel_lengthscale)
+            self.gp = SimpleGP(kernel_type=self.config.kernel_type, lengthscale=self.config.kernel_lengthscale)
 
     def discover(self) -> Dict:
         """

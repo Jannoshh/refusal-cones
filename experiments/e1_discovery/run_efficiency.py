@@ -196,6 +196,12 @@ def main():
     parser.add_argument("--model", default="gemma-2-2b", help="Model to use")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", default="results")
+    parser.add_argument("--use_sparse_gp", action="store_true", help="Use sparse GP for acquisition")
+    parser.add_argument("--kernel", default="rbf", choices=["rbf", "linear"], help="Kernel type for GP")
+    parser.add_argument("--lengthscale", type=float, default=0.3, help="Kernel lengthscale")
+    parser.add_argument("--num_inducing", type=int, default=64, help="Inducing points for sparse GP")
+    parser.add_argument("--sparse_steps", type=int, default=10, help="Sparse GP training steps")
+    parser.add_argument("--sparse_lr", type=float, default=0.05, help="Sparse GP learning rate")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -232,6 +238,12 @@ def main():
         n_gradient_steps=20,
         n_local_iterations=30,
         enable_global_search=False,
+        use_sparse_gp=args.use_sparse_gp,
+        kernel_type=args.kernel,
+        kernel_lengthscale=args.lengthscale,
+        num_inducing=args.num_inducing,
+        sparse_train_steps=args.sparse_steps,
+        sparse_lr=args.sparse_lr,
     )
     gradient_results = run_gradient_discovery(
         model, tokenizer, v_init, harmful_prompts, judge, gradient_config
@@ -252,6 +264,12 @@ def main():
         n_iterations=80,
         acquisition_type="ucb",
         beta=2.0,
+        use_sparse_gp=args.use_sparse_gp,
+        kernel_type=args.kernel,
+        kernel_lengthscale=args.lengthscale,
+        num_inducing=args.num_inducing,
+        sparse_train_steps=args.sparse_steps,
+        sparse_lr=args.sparse_lr,
     )
     gp_results = run_pure_gp_discovery(
         model, tokenizer, harmful_prompts, judge, n_layers, hidden_dim, gp_config
