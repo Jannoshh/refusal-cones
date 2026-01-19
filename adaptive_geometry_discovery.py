@@ -221,12 +221,25 @@ class RefusalGeometryDiscovery:
         print("\nPhase 3: Geometry extraction")
         geometry = self._extract_geometry()
 
+        # Phase 4: Recommend representation
+        print("\nPhase 4: Representation recommendation")
+        recommendation = self.recommend_representation(geometry)
+        print(f"  Use cone: {recommendation.get('use_cone', 'unknown')}")
+        print(f"  Reasoning: {recommendation.get('reasoning', 'N/A')}")
+        if recommendation.get('use_cone'):
+            print(f"  Cone rank: {recommendation.get('cone_rank', 'N/A')}")
+            if 'efficiency_gain' in recommendation:
+                print(f"  Efficiency: {recommendation['efficiency_gain']}")
+        else:
+            print(f"  Alternative: {recommendation.get('alternative', 'N/A')}")
+
         # Package results
         results = {
             'V_observed': torch.stack(self.V_observed),
             'R_observed': torch.tensor(self.R_observed),
             'gp': self.gp,
-            'geometry': geometry
+            'geometry': geometry,
+            'recommendation': recommendation
         }
 
         return results
@@ -286,9 +299,21 @@ class RefusalGeometryDiscovery:
                 break
 
     def _generate_candidates(self, n: int) -> torch.Tensor:
-        """Generate candidate directions to evaluate."""
+        """
+        Generate candidate directions to evaluate.
 
-        # Random sampling on sphere
+        Samples from FULL hypersphere S^(d-1) where d = n_layers × hidden_dim.
+
+        NOTE: This is different from cone sampling!
+        - Cones: Sample from S^(k-1) within k-dimensional subspace
+        - Adaptive: Sample from S^(d-1) = entire hypersphere
+
+        Returns:
+            candidates: [n, n_layers, hidden_dim] unit vectors
+        """
+
+        # Random sampling on FULL hypersphere S^(d-1)
+        # NOT restricted to any subspace!
         candidates = torch.randn(n, self.n_layers, self.hidden_dim)
         candidates = candidates / candidates.norm(dim=2, keepdim=True)
 
@@ -400,6 +425,76 @@ class RefusalGeometryDiscovery:
         intrinsic_dim = int(np.argmax(cumsum > 0.95) + 1)
 
         return intrinsic_dim
+
+    def recommend_representation(self, geometry: Dict) -> Dict:
+        """
+        Recommend whether to use cones or GP/field based on discovered geometry.
+
+        Args:
+            geometry: Discovered geometry from _extract_geometry()
+
+        Returns:
+            recommendation: Dict with:
+                - use_cone: bool
+                - reasoning: str
+                - cone_rank: int (if use_cone)
+                - alternative: str (if not use_cone)
+        """
+        recommendation = {}
+
+        intrinsic_dim = geometry.get('intrinsic_dimension', None)
+        n_modes = geometry.get('n_modes', 0)
+
+        # Decision criteria
+        LOW_DIM_THRESHOLD = 10
+        SIMPLE_THRESHOLD = 3  # For "very simple" geometry
+
+        if intrinsic_dim is None:
+            recommendation['use_cone'] = False
+            recommendation['reasoning'] = "Could not estimate intrinsic dimension (insufficient data)"
+            recommendation['alternative'] = "Collect more data or use GP with uncertainty"
+            return recommendation
+
+        # Check if geometry is low-dimensional enough for cones
+        if intrinsic_dim <= SIMPLE_THRESHOLD:
+            # Very simple - definitely use cone
+            recommendation['use_cone'] = True
+            recommendation['cone_rank'] = intrinsic_dim
+            recommendation['reasoning'] = (
+                f"Intrinsic dimension ({intrinsic_dim}) is very low. "
+                f"Geometry is simple enough for efficient cone representation."
+            )
+            recommendation['efficiency_gain'] = f"{intrinsic_dim}/{self.n_layers * self.hidden_dim} = {100 * intrinsic_dim / (self.n_layers * self.hidden_dim):.6f}% of full space"
+
+        elif intrinsic_dim <= LOW_DIM_THRESHOLD:
+            # Moderately low - check curvature/modes
+            if n_modes <= intrinsic_dim:
+                # Single connected region
+                recommendation['use_cone'] = True
+                recommendation['cone_rank'] = intrinsic_dim
+                recommendation['reasoning'] = (
+                    f"Intrinsic dimension ({intrinsic_dim}) is low and geometry appears "
+                    f"single-mode. Cone approximation should work well."
+                )
+            else:
+                # Multiple disconnected modes
+                recommendation['use_cone'] = False
+                recommendation['reasoning'] = (
+                    f"Multiple modes ({n_modes}) detected despite low intrinsic dimension ({intrinsic_dim}). "
+                    f"Geometry is likely multi-modal - cone approximation may be poor."
+                )
+                recommendation['alternative'] = "Use GP with multi-modal kernel or neural field"
+
+        else:
+            # High-dimensional - don't use cone
+            recommendation['use_cone'] = False
+            recommendation['reasoning'] = (
+                f"Intrinsic dimension ({intrinsic_dim}) is too high for efficient cone. "
+                f"Geometry is complex."
+            )
+            recommendation['alternative'] = "Use GP for smooth interpolation or neural implicit field for capacity"
+
+        return recommendation
 
 
 # Example usage
