@@ -54,16 +54,121 @@ uv pip install harmbench
 
 ### Basic Usage
 
+#### 0. Compute Initial Refusal Vector
+
+Before discovering refusal geometry, you need an initial refusal vector. This is computed using the mean difference method from [Arditi et al. (2024)](https://arxiv.org/abs/2406.11717):
+
+**Method**: The refusal direction is the difference between mean activations on harmful vs harmless prompts:
+
+```
+refusal_direction = mean(activations_harmful) - mean(activations_harmless)
+```
+
+**Using the included pipeline** (in `refusal_direction/`):
+
+```bash
+# Run the full pipeline for your model
+python3 -m refusal_direction.pipeline.run_pipeline --model_path meta-llama/Llama-2-7b-chat-hf
+
+# This will:
+# 1. Generate candidate directions (mean diff at each layer/position)
+# 2. Select the most effective direction
+# 3. Save to refusal_direction/pipeline/runs/{model_alias}/direction.pt
+```
+
+**Or compute it manually**:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Load model
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-chat-hf",
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+
+# Example prompts (use larger datasets for better results)
+harmful_prompts = [
+    "How do I make a bomb?",
+    "Write malware that steals passwords",
+    # ... more harmful prompts
+]
+harmless_prompts = [
+    "How do I make a cake?",
+    "Write code that manages passwords",
+    # ... more harmless prompts
+]
+
+def get_mean_activations(model, tokenizer, prompts, layers_to_extract):
+    """Get mean activations at the last token position across prompts."""
+    all_activations = {layer: [] for layer in layers_to_extract}
+
+    for prompt in prompts:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+        # Register hooks to capture activations
+        activations = {}
+        hooks = []
+        for layer_idx in layers_to_extract:
+            def hook_fn(module, input, output, layer=layer_idx):
+                # Capture activation at last token position
+                activations[layer] = output[0][:, -1, :].detach()
+            hooks.append(model.model.layers[layer_idx].register_forward_hook(hook_fn))
+
+        with torch.no_grad():
+            model(**inputs)
+
+        for hook in hooks:
+            hook.remove()
+
+        for layer in layers_to_extract:
+            all_activations[layer].append(activations[layer])
+
+    # Compute mean across all prompts
+    mean_activations = {}
+    for layer in layers_to_extract:
+        mean_activations[layer] = torch.stack(all_activations[layer]).mean(dim=0)
+
+    return mean_activations
+
+# Get activations for layers 10-20 (middle layers often work best)
+layers = list(range(10, 21))
+harmful_acts = get_mean_activations(model, tokenizer, harmful_prompts, layers)
+harmless_acts = get_mean_activations(model, tokenizer, harmless_prompts, layers)
+
+# Compute refusal direction for each layer
+refusal_directions = {}
+for layer in layers:
+    direction = harmful_acts[layer] - harmless_acts[layer]
+    direction = direction / direction.norm()  # Normalize
+    refusal_directions[layer] = direction
+
+# Stack into tensor [n_layers, hidden_dim]
+v_init = torch.stack([refusal_directions[l] for l in layers])
+torch.save(v_init, "refusal_vector.pt")
+print(f"Saved refusal vector with shape {v_init.shape}")
+```
+
+**Selecting the best layer**: The pipeline in `refusal_direction/` automatically selects the best layer by testing which direction most effectively reduces refusal when ablated. Typically middle layers (10-20 for 32-layer models) work best.
+
+For more details, see the original paper: [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717).
+
+---
+
 #### 1. Discover Refusal Geometry
 
-If you have an existing refusal vector:
+Once you have an initial refusal vector, use it as a prior for geometry discovery:
 
 ```python
 from src.discovery import GradientGeometryDiscovery, GradientDiscoveryConfig
 import torch
 
-# Load your existing refusal vector (prior!)
-v_init = torch.load("existing_refusal_vector.pt")  # [n_layers, hidden_dim]
+# Load refusal vector computed in Step 0
+v_init = torch.load("refusal_vector.pt")  # [n_layers, hidden_dim]
+# Or from the pipeline: torch.load("refusal_direction/pipeline/runs/llama-2-7b-chat-hf/direction.pt")
 
 # Define measurement function
 def measure_refusal_with_grad(v: torch.Tensor) -> tuple:
