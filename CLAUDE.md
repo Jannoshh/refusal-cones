@@ -2,6 +2,8 @@
 
 **Adversarial research project for discovering and manipulating refusal mechanisms in LLMs**
 
+> **Based on:** [The Geometry of Refusal in Large Language Models](The%20Geometry%20of%20Refusal%20in%20Large%20Language%20Models.pdf) (arXiv:2502.17420)
+
 This repository implements state-of-the-art techniques for:
 1. Discovering the geometric structure of refusal subspaces in language models
 2. Training efficient steering vectors using PEFT (LoRA-style) adapters
