@@ -427,13 +427,14 @@ def run_pareto_discovery(
     )
 
     # Run discovery
+    # use_mean_diff_init=True (default) computes v_init from mean-diff of activations
     print("Starting Pareto discovery...")
     discovery = ParetoGeometryDiscovery(
         scorer=scorer,
         n_layers=n_layers,
         hidden_dim=hidden_dim,
         config=config,
-        v_init=v_init,
+        use_mean_diff_init=True,  # Compute v_init from scorer (ACE-style initialization)
     )
 
     results = discovery.discover()
@@ -939,7 +940,7 @@ def run_high_budget_discovery(
         n_layers=n_layers,
         hidden_dim=hidden_dim,
         config=config,
-        v_init=v_init,
+        use_mean_diff_init=True,  # Compute v_init from scorer
     )
 
     import time
