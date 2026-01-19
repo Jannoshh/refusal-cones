@@ -30,20 +30,26 @@ Instead of assuming refusal is a simple cone (linear subspace), we:
 
 ### Prerequisites
 
-```bash
-# Python 3.8+
-pip install torch transformers peft datasets
-pip install scikit-learn scipy numpy matplotlib
-
-# For HarmBench evaluation (optional)
-pip install harmbench
-```
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) - Fast Python package manager
 
 ### Installation
 
 ```bash
+# Clone the repository
 git clone <repo-url>
 cd refusal-cones
+
+# Create and activate virtual environment with uv
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies
+uv pip install torch transformers peft datasets
+uv pip install scikit-learn scipy numpy matplotlib
+
+# For HarmBench evaluation (optional)
+uv pip install harmbench
 ```
 
 ### Basic Usage
