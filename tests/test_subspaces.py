@@ -76,11 +76,8 @@ alpha = best_refusal_direction.norm().detach().clone()
 print(f"add_layer: {add_layer}, alpha: {alpha}")
 
 # %%
-splits = "saladbench"
-# splits = "cb"
-# max_train = 1024
-harmful_train = json.load(open(f'data/{splits}_splits/harmful_train.json'))
-harmless_train = json.load(open(f'data/{splits}_splits/harmless_train.json'))
+harmful_train = json.load(open('data/splits/harmful_train.json'))
+harmless_train = json.load(open('data/splits/harmless_train.json'))
 
 harmless_train = harmless_train[:len(harmful_train)]
 print(len(harmful_train), len(harmless_train))
@@ -195,7 +192,7 @@ def sample_hypersphere_gaussian(batch_size, dim):
 subspace = torch.load("subspace (1).pt")[-20:][6].cuda()
 print(subspace.shape)
 # %%
-val_data = json.load(open("data/saladbench_splits/harmful_val.json"))
+val_data = json.load(open("data/splits/harmful_val.json"))
 harmful_val_instructions = apply_chat_template(model.tokenizer, [d['instruction'] for d in val_data])
 # %%
 import numpy as np
