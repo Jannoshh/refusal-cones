@@ -4,9 +4,22 @@ Example: Training Unified RDO with Validation Evaluation
 
 Demonstrates:
 1. Training unified affine RDO with baseline fitting
-2. Periodic validation evaluation using refusal score proxies
+2. FAST validation using refusal token proxy (no generation)
 3. Model checkpointing based on validation metrics
-4. Final test set evaluation
+4. HEAVY final test evaluation with HarmBench (generation + classification)
+
+Key distinction:
+- VALIDATION (during training): Fast refusal token proxy
+  - No generation needed, just logits
+  - Measures P(refusal token | prompt)
+  - Fast enough to run every N steps
+  - Used for model selection
+
+- TEST (final evaluation): Heavy metrics
+  - Full generation + HarmBench classifier
+  - String matching, safety scores
+  - Only run once at the end
+  - Used for final reporting
 """
 
 import torch
@@ -29,6 +42,9 @@ class UnifiedRDOTrainerWithEval(UnifiedRDOTrainer):
     """
     Extended trainer that runs validation evaluation periodically.
 
+    Uses FAST refusal token proxy for validation (no generation needed).
+    Final test evaluation uses heavy metrics (HarmBench, etc.)
+
     Tracks:
     - ASR (Attack Success Rate) on validation set
     - Harmless compliance rate on validation set
@@ -40,20 +56,33 @@ class UnifiedRDOTrainerWithEval(UnifiedRDOTrainer):
         *args,
         eval_harmful_prompts=None,
         eval_harmless_prompts=None,
+        model_name: str = None,
         eval_every_n_steps: int = 100,
-        best_metric: str = 'asr',  # or 'harmless_compliance'
+        best_metric: str = 'asr',  # or 'separation'
         **kwargs
     ):
         super().__init__(*args, **kwargs)
 
         self.eval_harmful_prompts = eval_harmful_prompts
         self.eval_harmless_prompts = eval_harmless_prompts
+        self.model_name = model_name
         self.eval_every_n_steps = eval_every_n_steps
         self.best_metric = best_metric
 
         # Track best model
-        self.best_metric_value = float('inf') if best_metric == 'asr' else 0.0
+        self.best_metric_value = float('inf') if best_metric == 'asr' else float('-inf')
         self.best_model_state = None
+
+        # Initialize fast evaluator (refusal token proxy)
+        if eval_harmful_prompts is not None and model_name is not None:
+            from refusal_token_eval import RefusalTokenEvaluator
+            self.fast_evaluator = RefusalTokenEvaluator(
+                self.model,
+                self.tokenizer,
+                model_name
+            )
+        else:
+            self.fast_evaluator = None
 
     def evaluation_loop(
         self,
@@ -63,55 +92,53 @@ class UnifiedRDOTrainerWithEval(UnifiedRDOTrainer):
         ignore_keys: bool = None,
         metric_key_prefix: str = "eval"
     ):
-        """Run validation evaluation."""
+        """Run validation evaluation using FAST refusal token proxy."""
 
         # Skip if no eval data
-        if self.eval_harmful_prompts is None or self.eval_harmless_prompts is None:
+        if self.fast_evaluator is None:
             return super().evaluation_loop(
                 dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
             )
 
         print("\n" + "=" * 70)
-        print("Running Validation Evaluation")
+        print("Running Validation Evaluation (Fast Refusal Token Proxy)")
         print("=" * 70)
 
-        # Run evaluation
-        from unified_rdo_eval import UnifiedRDOEvaluator
-
-        evaluator = UnifiedRDOEvaluator(
-            self.model,
-            self.tokenizer,
-            use_harmbench=True,
-            use_llama_guard=False,
-            use_strongreject=False
-        )
-
-        results = evaluator.evaluate(
+        # Run FAST evaluation (no generation, just logits)
+        results = self.fast_evaluator.evaluate(
             harmful_prompts=self.eval_harmful_prompts,
             harmless_prompts=self.eval_harmless_prompts,
-            max_new_tokens=50,
-            batch_size=8
+            batch_size=16  # Can use larger batch since no generation
         )
 
+        print(results.summary())
+
         # Log metrics
+        separation = results.harmful_refusal_score - results.harmless_refusal_score
+
         metrics = {
             f"{metric_key_prefix}_asr": results.asr,
-            f"{metric_key_prefix}_harmless_compliance": results.harmless_compliance_rate,
             f"{metric_key_prefix}_harmless_refusal": results.harmless_refusal_rate,
+            f"{metric_key_prefix}_harmful_score": results.harmful_refusal_score,
+            f"{metric_key_prefix}_harmless_score": results.harmless_refusal_score,
+            f"{metric_key_prefix}_separation": separation,
         }
 
         # Check if best model
-        current_value = results.asr if self.best_metric == 'asr' else results.harmless_compliance_rate
-
         if self.best_metric == 'asr':
+            current_value = results.asr
             is_best = current_value < self.best_metric_value  # Want LOW ASR
+        elif self.best_metric == 'separation':
+            current_value = separation
+            is_best = current_value > self.best_metric_value  # Want HIGH separation
         else:
-            is_best = current_value > self.best_metric_value  # Want HIGH compliance
+            current_value = results.harmful_refusal_score
+            is_best = current_value > self.best_metric_value  # Want HIGH refusal
 
         if is_best:
             self.best_metric_value = current_value
             self.best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-            print(f"\n🌟 New best model! {self.best_metric} = {current_value:.1%}")
+            print(f"\n🌟 New best model! {self.best_metric} = {current_value:.3f if 'score' in self.best_metric or 'separation' in self.best_metric else f'{current_value:.1%}'}")
 
         print("=" * 70)
 
@@ -264,15 +291,17 @@ def train_with_validation(
     )
 
     # Create trainer with validation
-    print("\n7. Initializing trainer with validation evaluation...")
+    print("\n7. Initializing trainer with fast validation evaluation...")
+    print("   (Uses refusal token proxy - no generation needed)")
     trainer = UnifiedRDOTrainerWithEval(
         model=model,
         args=training_args,
         train_dataset=dataset,
         eval_harmful_prompts=harmful_val,
         eval_harmless_prompts=harmless_val,
+        model_name=model_name,  # For refusal token lookup
         eval_every_n_steps=eval_every_n_steps,
-        best_metric='asr',  # or 'harmless_compliance'
+        best_metric='separation',  # or 'asr'
         lambda_harmful=1.0,
         lambda_harmless=0.5
     )
@@ -292,8 +321,9 @@ def train_with_validation(
     model.save_pretrained(f"{output_dir}/best_model")
     tokenizer.save_pretrained(f"{output_dir}/best_model")
 
-    # Final test evaluation
-    print("\n10. Running final test set evaluation...")
+    # Final test evaluation with HEAVY metrics (HarmBench, generation)
+    print("\n10. Running final test set evaluation (HEAVY - with generation + HarmBench)...")
+    print("    This is slow but accurate - only for final test, not validation!")
     test_results = evaluate_unified_rdo(
         model,
         tokenizer,
@@ -301,7 +331,9 @@ def train_with_validation(
         harmless_split='test',
         n_harmful=200,
         n_harmless=200,
-        use_harmbench=True,
+        use_harmbench=True,  # Heavy but accurate
+        use_llama_guard=False,  # Can enable if needed
+        use_strongreject=False,  # Can enable if needed
         save_responses=True,
         output_file=f"{output_dir}/test_results.json"
     )
@@ -324,10 +356,13 @@ def main():
     print("=" * 70)
 
     print("\nThis script demonstrates:")
-    print("  1. Training with validation evaluation every N steps")
+    print("  1. FAST validation during training (refusal token proxy)")
+    print("     - No generation, just logits - very fast!")
+    print("     - Runs every N steps for model selection")
     print("  2. Automatic baseline fitting from data")
-    print("  3. Checkpointing best model based on validation ASR")
-    print("  4. Final test set evaluation")
+    print("  3. Checkpointing best model based on validation metrics")
+    print("  4. HEAVY final test evaluation (HarmBench + generation)")
+    print("     - Only runs once at the end - slow but accurate!")
 
     print("\n" + "-" * 70)
     print("Configuration")
