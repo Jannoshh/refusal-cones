@@ -383,101 +383,15 @@ python gradient_discovery.py  # Runs demo comparing both
 
 ## Next Steps
 
-### Immediate (Ready to Run)
+See **[NEXT_STEPS.md](NEXT_STEPS.md)** for detailed roadmap with timelines and milestones.
 
-1. **Load your existing refusal vector**
-   ```python
-   v_init = torch.load("your_vector.pt")
-   ```
+**Quick summary:**
+- **Immediate (Week 1):** Implement `measure_refusal_with_grad`, run discovery, train → First working jailbreak
+- **Short-term (Month 1):** Tune params, ablation studies, multi-model → Publication-ready results
+- **Medium-term (Quarter 1):** Category-specific, RL stage, neural fields → Advanced features
+- **Long-term (Ongoing):** Theory, benchmarking, interpretability → Research contributions
 
-2. **Run gradient-based discovery** (~30 minutes)
-   ```python
-   # See "Basic Usage" section above
-   discovery = GradientGeometryDiscovery(...)
-   results = discovery.discover()
-   ```
-
-3. **Analyze discovered geometry**
-   ```python
-   print(results['geometry'])
-   # - How many modes?
-   # - Intrinsic dimension?
-   # - Use cone or not?
-   ```
-
-4. **Train with RDO** (~6 hours)
-   ```python
-   model = initialize_from_discovery(results)
-   trained = train_rdo_with_peft(model, ...)
-   ```
-
-### Short-term (Enhancements)
-
-1. **Implement measure_refusal_with_grad for your model**
-   - Apply projection to activations
-   - Generate completions
-   - Score with classifier
-   - Compute gradient via backprop
-
-2. **Prepare datasets**
-   - Harmful examples (for ablation/addition)
-   - Harmless examples (for retain)
-   - Test set (for evaluation)
-
-3. **Tune hyperparameters**
-   - Discovery: `gradient_lr`, `kappa_decay`, `beta`
-   - Training: `lambda_ablate`, `lambda_add`, `lambda_retain`
-
-4. **Run ablation studies**
-   - Gradient vs no gradient
-   - Prior vs random init
-   - Different cone ranks
-
-### Medium-term (Extensions)
-
-1. **Multi-model discovery**
-   - Discover geometry for Llama-2-7B
-   - Transfer to Llama-2-13B (warm start)
-   - Compare geometries
-
-2. **Category-specific refusal**
-   - Discover separate geometries for:
-     - Violence refusal
-     - Legal refusal
-     - NSFW refusal
-   - Train category-specific vectors
-
-3. **Reinforcement learning stage**
-   - After SFT with discovered vectors
-   - Use GRPO to maximize harmfulness
-   - Integrate with TRL library
-
-4. **Neural implicit fields**
-   - For complex geometries (intrinsic_dim > 10)
-   - Replace GP with neural field
-   - Better capacity for curved manifolds
-
-### Long-term (Research)
-
-1. **Theoretical analysis**
-   - Prove convergence rates for hybrid approach
-   - Information-theoretic bounds
-   - Sample complexity analysis
-
-2. **Benchmarking**
-   - Compare against baselines on HarmBench
-   - Measure transferability across models
-   - Ablation studies on components
-
-3. **Interpretability**
-   - What do discovered modes represent?
-   - Visualize activation space
-   - Probe intermediate layers
-
-4. **Defensive applications**
-   - Use discovery to understand refusal
-   - Build more robust safety training
-   - Detect jailbreak attempts
+**Start here:** See `example_measure_function.py` for implementing the measurement function with proper batch sizing and gradient computation.
 
 ## Troubleshooting
 
