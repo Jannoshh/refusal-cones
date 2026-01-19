@@ -155,7 +155,13 @@ def generate_with_intervention(model, prompts, vectors):
 
 ## Impact on RL Training
 
-### Current Approach (Hooks)
+### ⚠️ CORRECTION: Initial Analysis Was Wrong!
+
+**You were right** - weight modifications CAN work for training if done properly (like LoRA)!
+
+The error was thinking of weight modifications as external operations. If they're part of the forward pass, gradients flow correctly!
+
+### Approach 1: Hooks (Current)
 
 ```python
 def grpo_step(prompts, vectors):
@@ -175,41 +181,70 @@ def grpo_step(prompts, vectors):
 
 **Clean and straightforward** ✅
 
-### Proposed Approach (Weight Modifications)
+### Approach 2: Weight Modifications (LoRA-style) ✅ ALSO WORKS!
 
 ```python
-def grpo_step(prompts, vectors):
-    # 1. Sample vector perturbations
-    sampled_vectors = [sample_noise(vectors) for _ in K]
+class VectorModifiedLayer(nn.Module):
+    """Like LoRA: modify weights in forward pass."""
 
-    # 2. Generate with each (requires weight modifications)
-    for v_set in sampled_vectors:
-        # Apply modifications
-        apply_modifications(model, v_set)  # Changes model state
+    def __init__(self, base_layer, vector):
+        super().__init__()
+        self.base_layer = base_layer
+        self.vector = nn.Parameter(vector)  # Trainable!
 
-        # Generate
-        completions = model.generate(prompts)  # Not in computation graph!
+        # Freeze base
+        for p in base_layer.parameters():
+            p.requires_grad = False
 
-        # Restore
-        restore_weights(model)  # Changes model state again
+    def forward(self, x):
+        # Compute projection matrix (differentiable w.r.t. v!)
+        P = torch.eye(len(self.vector)) - torch.outer(self.vector, self.vector)
 
-        # ❌ How do gradients flow back to vectors?
-        # ❌ Weight modifications broke the computation graph
+        # Modify weight in forward pass (in computation graph!)
+        W_modified = P @ self.base_layer.weight
 
-    # 3. Compute loss and backprop
-    loss.backward()  # ❌ No gradients to vectors!
+        # Forward with modified weights
+        return F.linear(x, W_modified, self.base_layer.bias)
 
-    # Would need to manually compute gradients through weight modifications
-    # Much more complex!
+# Training works because modifications are in forward pass!
+def grpo_step(prompts, wrapped_model):
+    # Model has VectorModifiedLayer wrappers
+    completions = wrapped_model.generate(prompts)
+    # ✓ Vectors are in computation graph (part of forward!)
+    # ✓ Gradients flow through torch.outer() and matrix ops
+
+    loss.backward()  # ✓ Gradients flow to vectors!
+    optimizer.step()  # ✓ Update vectors
 ```
 
-**Problem:** Weight modifications are outside the computation graph!
+**This works because:**
+1. `torch.outer(v, v)` is differentiable w.r.t. `v` ✓
+2. `P @ W` is differentiable w.r.t. `P` ✓
+3. Chain rule: `∂L/∂v = ∂L/∂P · ∂P/∂v` ✓
+4. PyTorch handles this automatically! ✓
 
-We'd need to:
-1. Track how weight modifications depend on vectors
-2. Manually compute gradients through the modification operation
-3. Accumulate gradients correctly
-4. Much more complex!
+**This is exactly how LoRA works!**
+
+### Initial Error
+
+The mistake was thinking of weight modifications like this:
+
+```python
+# WRONG - outside computation graph
+model.weight.data = modify(model.weight.data, v)  # ❌
+output = model(x)  # No gradient to v
+```
+
+Instead, they should be like this:
+
+```python
+# RIGHT - inside computation graph
+def forward(x, weight, v):
+    W_modified = modify(weight, v)  # ✓ Differentiable!
+    return W_modified @ x
+```
+
+The key: modifications must be part of the differentiable forward pass.
 
 ## Hybrid Approach: Best of Both Worlds?
 
@@ -239,28 +274,50 @@ model.save_pretrained('model_with_steering')
 outputs = model.generate(prompts)  # Fast, no hooks!
 ```
 
-## Recommendation
+## Recommendation (Updated)
 
 **For your use case (RL training of steering vectors):**
 
-### Keep Hooks for Training ✅
+### Both Approaches Work! ✅
 
-**Reasons:**
-1. **Gradient flow:** Vectors stay in computation graph
-2. **Flexibility:** Easy to try different vectors during exploration
-3. **Safety:** Model stays frozen (non-destructive)
-4. **Simplicity:** No weight apply/restore logic needed
+After correction, both hooks and weight modifications support gradient flow for training.
 
-### Use Weight Modifications for Deployment (Optional)
+**Hooks (Current approach)**:
+- ✓ Simpler code (no layer wrapping)
+- ✓ Non-destructive (easy to swap vectors)
+- ✓ Current implementation already works
+- ✓ Easier to debug
 
-After training, if you want to deploy the final steering vectors:
+**Weight Modifications (LoRA-style)**:
+- ✓ More similar to LoRA/PEFT patterns
+- ✓ Could integrate with existing tools
+- ✓ Potentially cleaner for some use cases
+- ✓ Vectors are explicit nn.Parameters
+
+### Recommended Strategy
+
+**For training**: Stick with hooks (current implementation)
+- Already working and well-tested
+- Simpler code
+- No need to change
+
+**For deployment** (optional): Convert to weight modifications
 ```python
-# One-time conversion
-apply_vector_modifications(model, trained_vectors)
+# After training
+apply_vectors_to_weights_permanent(model, trained_vectors)
 model.save_pretrained('steered_model')
+# Now vectors are baked into weights (no hooks at inference)
 ```
 
-Now you have a standalone model with steering baked in.
+### When to Consider Weight Modifications for Training
+
+Use VectorModifiedLayer approach if:
+- You want LoRA-style integration
+- Using PEFT or similar frameworks
+- Want vectors as explicit nn.Parameters
+- Prefer class-based architecture
+
+Otherwise, hooks are simpler and work just as well!
 
 ## Code Addition: Conversion Utilities
 
