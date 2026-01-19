@@ -93,6 +93,44 @@ Combine the best of both:
    - Saves random exploration phase
 ```
 
+### GP Types: Choosing the Right One
+
+The discovery searches over `[n_layers, hidden_dim]` matrices. Three GP types are available:
+
+| GP Type | Layer Structure | Scaling | Recommended |
+|---------|-----------------|---------|-------------|
+| `'structured'` | Smoothness + ARD | O(n³) but layer-aware | **Yes (default)** |
+| `'sparse'` | None (flattens) | O(nM²) with M inducing | For large-scale |
+| `'simple'` | None (flattens) | O(n³) | No (baseline only) |
+
+**Structured GP (default)** models layer dependencies:
+- **Layer smoothness**: Adjacent layers have correlated directions (RBF over layer indices)
+- **ARD (Automatic Relevance Determination)**: Learns which layers matter for refusal
+
+```python
+from src.discovery import GeometryConfig
+
+config = GeometryConfig(
+    gp_type='structured',           # Default - models layer dependencies
+    layer_lengthscale=3.0,          # Smoothness across ~3 adjacent layers
+    feature_lengthscale=1.0,        # RBF for features within each layer
+    init_layer_weights='middle',    # Start with middle-layer bias
+    learn_layer_weights=True,       # ARD: learn which layers matter
+)
+```
+
+**How ARD learns layer importance**: The GP optimizes layer weights to maximize marginal likelihood. Layers that don't affect R get weight → 0. This is learned jointly from all observations, not by testing layers individually.
+
+Example output after discovery:
+```
+Learned layer importance (ARD):
+  Layer 14: 2.341   ← middle layers dominate
+  Layer 13: 1.892
+  Layer 15: 1.456
+  Layer 12: 0.891
+  Layer  0: 0.023   ← early/late layers less important
+```
+
 ### Algorithm: Gradient-Informed Active Learning
 
 ```python
@@ -499,12 +537,19 @@ def ultra_efficient_discovery(
 
 | Method | Measurements | Time | Success Rate |
 |--------|-------------|------|--------------|
-| **Pure GP (current)** | 500 | 4 hours | High |
-| **GP + Prior** | 200 | 1.5 hours | High |
-| **GP + Gradients** | 100 | 40 min | High |
-| **GP + Gradients + Prior** | **50** | **20 min** | **Very High** |
+| **Pure GP (simple)** | 500 | 4 hours | High |
+| **Structured GP** | 200 | 1.5 hours | High |
+| **Structured GP + Gradients** | 100 | 40 min | High |
+| **Structured GP + Gradients + Prior** | **50** | **20 min** | **Very High** |
 
 **Total speedup: 10× fewer measurements, 12× faster!**
+
+**New defaults (prevent OOM):**
+- `n_candidates=100` (was 1000)
+- `n_iterations=30` (was 100)
+- `gp_type='structured'` (was 'simple')
+
+Memory warning is printed at discovery start showing estimated usage.
 
 ## Why This Matters
 

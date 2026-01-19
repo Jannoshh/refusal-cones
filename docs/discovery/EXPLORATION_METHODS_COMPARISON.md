@@ -130,6 +130,48 @@ for i in range(20):
 | **Handles complex geometry** | No | Yes | Yes |
 | **Efficiency** | High (if correct) | Low | **Very High** ✓ |
 
+## GP Type Selection
+
+When using GP-based exploration, three GP types are available:
+
+| GP Type | Layer Structure | Best For |
+|---------|-----------------|----------|
+| `'structured'` | Smoothness + ARD | **Default, recommended** |
+| `'sparse'` | None (inducing points) | Large-scale, memory-constrained |
+| `'simple'` | None (dense) | Baseline only |
+
+### Structured GP (Default)
+
+The **StructuredLayerGP** models layer dependencies:
+
+- **Layer smoothness**: Adjacent layers have correlated directions
+- **ARD (Automatic Relevance Determination)**: Learns which layers matter
+
+```python
+from src.discovery import GeometryConfig
+
+config = GeometryConfig(
+    gp_type='structured',           # Models layer dependencies
+    layer_lengthscale=3.0,          # Smoothness across ~3 adjacent layers
+    learn_layer_weights=True,       # ARD: automatically learn layer importance
+    init_layer_weights='middle',    # Start biased toward middle layers
+
+    # Reduced defaults to prevent OOM
+    n_candidates=100,               # Was 1000
+    n_iterations=30,                # Was 100
+)
+```
+
+**How ARD learns layer importance:** Layer weights are optimized to maximize marginal likelihood. Layers that don't affect R get weight → 0. This is learned jointly, not by testing layers individually.
+
+Example output:
+```
+Learned layer importance (ARD):
+  Layer 14: 2.341   ← middle layers dominate
+  Layer 13: 1.892
+  Layer  0: 0.023   ← early/late layers less important
+```
+
 ## Information Gain Analysis
 
 ### Without Gradients (Pure GP)

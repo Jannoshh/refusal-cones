@@ -23,23 +23,36 @@ class GeometryConfig:
     """Configuration for adaptive geometry discovery."""
 
     # Exploration
-    n_init_random: int = 20  # Initial random samples
-    n_iterations: int = 100  # Active exploration iterations
-    n_candidates: int = 1000  # Candidates per iteration
+    n_init_random: int = 10  # Initial random samples
+    n_iterations: int = 30  # Active exploration iterations
+    n_candidates: int = 100  # Candidates per iteration (keep low to avoid OOM)
 
     # Acquisition
     acquisition_type: str = 'ucb'  # 'ucb', 'ei', or 'boundary'
     beta: float = 2.0  # UCB exploration parameter
 
-    # GP (if using sklearn/gpytorch)
+    # GP type: 'sparse', 'structured', or 'simple'
+    gp_type: str = 'structured'  # 'structured' models layer dependencies
+
+    # GP kernel settings (for 'simple' and 'sparse')
     kernel_type: str = 'rbf'  # 'rbf', 'linear', or 'rbf+linear'
     kernel_lengthscale: float = 1.0
-    use_sparse_gp: bool = False
+
+    # Sparse GP settings (gp_type='sparse')
+    use_sparse_gp: bool = True  # Legacy flag; only used if gp_type is unset/invalid
     num_inducing: int = 64
     sparse_train_steps: int = 15
     sparse_lr: float = 0.05
     sparse_max_train_points: int = 256
     sparse_jitter: float = 1e-5
+
+    # Structured GP settings (gp_type='structured')
+    # Models layer smoothness + learns layer importance via ARD
+    layer_lengthscale: float = 3.0  # Smoothness across ~3 adjacent layers
+    feature_lengthscale: float = 1.0  # RBF lengthscale for features
+    init_layer_weights: str = 'middle'  # 'middle', 'uniform', or 'learned'
+    learn_layer_weights: bool = True  # Learn which layers matter via ARD
+    structured_train_steps: int = 20
 
     # Stopping
     convergence_threshold: float = 0.01
@@ -112,7 +125,7 @@ class SimpleGP:
         mean = K_test_train @ alpha
 
         # Predictive variance
-        v = torch.triangular_solve(K_test_train.T, L, upper=False)[0]
+        v = torch.linalg.solve_triangular(L, K_test_train.T, upper=False)
         var = torch.diag(K_test_test) - (v ** 2).sum(dim=0)
 
         # Ensure non-negative variance
@@ -274,7 +287,7 @@ class AdaptiveSparseGP:
 
             K_nm = self._kernel(V_train, Z)  # [n, m]
             # Φ = K_nm K_mm^{-1/2}
-            tmp = torch.triangular_solve(K_nm.T, L_mm, upper=False).solution  # [m, n]
+            tmp = torch.linalg.solve_triangular(L_mm, K_nm.T, upper=False)  # [m, n]
             phi = tmp.T  # [n, m]
 
             lambda_ = self.noise_var
@@ -303,7 +316,7 @@ class AdaptiveSparseGP:
             self.L_mm = self._stable_cholesky(K_mm_base)
 
             K_nm = self._kernel(V_train, Z)
-            tmp = torch.triangular_solve(K_nm.T, self.L_mm, upper=False).solution
+            tmp = torch.linalg.solve_triangular(self.L_mm, K_nm.T, upper=False)
             phi = tmp.T
 
             A = phi.T @ phi + self.noise_var * torch.eye(len(Z), device=device)
@@ -331,7 +344,7 @@ class AdaptiveSparseGP:
 
         K_sm = self._kernel(Vt, self.inducing_points)  # [m, M]
         # Φ_* = K_sm K_mm^{-1/2}
-        tmp = torch.triangular_solve(K_sm.T, self.L_mm, upper=False).solution
+        tmp = torch.linalg.solve_triangular(self.L_mm, K_sm.T, upper=False)
         phi_star = tmp.T  # [m, M]
 
         mean = phi_star @ self.w
@@ -343,6 +356,242 @@ class AdaptiveSparseGP:
         std = torch.sqrt(var)
 
         return mean, std
+
+
+class StructuredLayerGP:
+    """
+    GP with structure-aware kernel for [n_layers, hidden_dim] directions.
+
+    Implements:
+    1. Layer smoothness: Adjacent layers have correlated directions
+    2. ARD layer weights: Learns which layers matter (middle layers typically)
+    3. Feature kernel: RBF on hidden_dim features
+
+    The kernel factorizes as:
+        K(v, v') = K_layer(i, j) * K_feature(v[i], v'[j])
+
+    Where K_layer encodes layer smoothness and importance.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        hidden_dim: int,
+        feature_lengthscale: float = 1.0,
+        layer_lengthscale: float = 3.0,  # Smoothness across ~3 layers
+        noise_var: float = 0.01,
+        learn_layer_weights: bool = True,
+        init_layer_weights: str = 'middle',  # 'middle', 'uniform', or 'learned'
+        train_steps: int = 20,
+        lr: float = 0.05,
+    ):
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
+        self.noise_var = noise_var
+        self.learn_layer_weights = learn_layer_weights
+        self.train_steps = train_steps
+        self.lr = lr
+
+        # Learnable parameters
+        self.log_feature_lengthscale = torch.tensor(feature_lengthscale).log()
+        self.log_layer_lengthscale = torch.tensor(layer_lengthscale).log()
+
+        # Layer importance weights (ARD-style)
+        # Initialize based on strategy
+        if init_layer_weights == 'middle':
+            # Bell curve centered on middle layers
+            layer_idx = torch.arange(n_layers, dtype=torch.float32)
+            middle = (n_layers - 1) / 2
+            weights = torch.exp(-0.5 * ((layer_idx - middle) / (n_layers / 4)) ** 2)
+            weights = weights / weights.sum() * n_layers  # Normalize to sum=n_layers
+        elif init_layer_weights == 'uniform':
+            weights = torch.ones(n_layers)
+        else:  # 'learned' - start uniform
+            weights = torch.ones(n_layers)
+
+        self.log_layer_weights = weights.log()
+
+        if learn_layer_weights:
+            self.log_layer_weights.requires_grad_(True)
+            self.log_feature_lengthscale.requires_grad_(True)
+            self.log_layer_lengthscale.requires_grad_(True)
+
+        # Training data
+        self.V_train = None  # [n, n_layers, hidden_dim]
+        self.R_train = None  # [n]
+
+        # Cached for prediction
+        self.L = None
+        self.alpha = None
+
+    @property
+    def feature_lengthscale(self):
+        return self.log_feature_lengthscale.exp()
+
+    @property
+    def layer_lengthscale(self):
+        return self.log_layer_lengthscale.exp()
+
+    @property
+    def layer_weights(self):
+        # Softmax to ensure positive and normalized
+        return torch.softmax(self.log_layer_weights, dim=0) * self.n_layers
+
+    def _layer_kernel(self) -> torch.Tensor:
+        """
+        Compute layer-layer kernel matrix [n_layers, n_layers].
+
+        Encodes: adjacent layers are correlated, weighted by importance.
+        """
+        idx = torch.arange(self.n_layers, dtype=torch.float32)
+        # Layer distance matrix
+        layer_dist_sq = (idx.unsqueeze(0) - idx.unsqueeze(1)) ** 2
+        # RBF for smoothness
+        K_smooth = torch.exp(-layer_dist_sq / (2 * self.layer_lengthscale ** 2))
+        # Weight by layer importance (outer product)
+        w = self.layer_weights.sqrt()
+        K_weighted = K_smooth * w.unsqueeze(0) * w.unsqueeze(1)
+        return K_weighted
+
+    def _feature_kernel(self, V1: torch.Tensor, V2: torch.Tensor, layer: int) -> torch.Tensor:
+        """
+        Compute feature kernel for a single layer.
+
+        Args:
+            V1: [n1, hidden_dim] features at layer for first set
+            V2: [n2, hidden_dim] features at layer for second set
+
+        Returns:
+            K: [n1, n2] kernel matrix
+        """
+        # Normalize to unit sphere
+        V1_norm = V1 / (V1.norm(dim=1, keepdim=True) + 1e-8)
+        V2_norm = V2 / (V2.norm(dim=1, keepdim=True) + 1e-8)
+
+        # Cosine similarity -> geodesic distance
+        dots = V1_norm @ V2_norm.T
+        dots = torch.clamp(dots, -1, 1)
+        dist_sq = 2 * (1 - dots)
+
+        K = torch.exp(-dist_sq / (2 * self.feature_lengthscale ** 2))
+        return K
+
+    def _full_kernel(self, V1: torch.Tensor, V2: torch.Tensor) -> torch.Tensor:
+        """
+        Compute full structured kernel.
+
+        Args:
+            V1: [n1, n_layers, hidden_dim]
+            V2: [n2, n_layers, hidden_dim]
+
+        Returns:
+            K: [n1, n2] kernel matrix
+        """
+        n1, n2 = len(V1), len(V2)
+        K_layer = self._layer_kernel()  # [n_layers, n_layers]
+
+        # Sum over layers with layer kernel weighting
+        K = torch.zeros(n1, n2)
+        for i in range(self.n_layers):
+            for j in range(self.n_layers):
+                if K_layer[i, j] > 0.01:  # Skip negligible contributions
+                    K_feat = self._feature_kernel(V1[:, i, :], V2[:, j, :], i)
+                    K = K + K_layer[i, j] * K_feat
+
+        # Normalize
+        K = K / self.n_layers
+        return K
+
+    def fit(self, V: torch.Tensor, R: torch.Tensor):
+        """
+        Fit GP to observations.
+
+        Args:
+            V: [n, n_layers, hidden_dim] observed directions
+            R: [n] observed refusal strengths
+        """
+        # Handle flattened input (reshape if needed)
+        if V.dim() == 2:
+            V = V.reshape(-1, self.n_layers, self.hidden_dim)
+
+        self.V_train = V
+        self.R_train = R
+
+        if self.learn_layer_weights and len(V) > 5:
+            self._optimize_hyperparameters()
+
+        self._update_cache()
+
+    def _optimize_hyperparameters(self):
+        """Optimize kernel hyperparameters via marginal likelihood."""
+        params = [self.log_layer_weights, self.log_feature_lengthscale, self.log_layer_lengthscale]
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+
+        for _ in range(self.train_steps):
+            optimizer.zero_grad()
+
+            K = self._full_kernel(self.V_train, self.V_train)
+            K = K + self.noise_var * torch.eye(len(K))
+            K = K + 1e-5 * torch.eye(len(K))  # Jitter
+
+            try:
+                L = torch.linalg.cholesky(K)
+            except torch.linalg.LinAlgError:
+                continue
+
+            # Log marginal likelihood
+            alpha = torch.cholesky_solve(self.R_train.unsqueeze(-1), L).squeeze(-1)
+            data_fit = -0.5 * (self.R_train @ alpha)
+            complexity = -torch.diag(L).log().sum()
+            lml = data_fit + complexity
+
+            (-lml).backward()  # Maximize LML
+            optimizer.step()
+
+    def _update_cache(self):
+        """Update cached Cholesky and alpha for prediction."""
+        K = self._full_kernel(self.V_train, self.V_train)
+        K = K + self.noise_var * torch.eye(len(K))
+        K = K + 1e-5 * torch.eye(len(K))
+
+        self.L = torch.linalg.cholesky(K)
+        self.alpha = torch.cholesky_solve(self.R_train.unsqueeze(-1), self.L).squeeze(-1)
+
+    def predict(self, V_test: torch.Tensor) -> tuple:
+        """
+        Predict R(v) for test directions.
+
+        Args:
+            V_test: [m, n_layers * hidden_dim] or [m, n_layers, hidden_dim]
+
+        Returns:
+            mean: [m] predicted values
+            std: [m] standard deviations
+        """
+        # Handle flattened input
+        if V_test.dim() == 2 and V_test.shape[1] == self.n_layers * self.hidden_dim:
+            V_test = V_test.reshape(-1, self.n_layers, self.hidden_dim)
+
+        if self.V_train is None:
+            return torch.zeros(len(V_test)), torch.ones(len(V_test))
+
+        K_test_train = self._full_kernel(V_test, self.V_train)
+        K_test_test = self._full_kernel(V_test, V_test)
+
+        # Predictive mean
+        mean = K_test_train @ self.alpha
+
+        # Predictive variance
+        v = torch.linalg.solve_triangular(self.L, K_test_train.T, upper=False)
+        var = torch.diag(K_test_test) - (v ** 2).sum(dim=0)
+        var = torch.clamp(var, min=1e-6)
+        std = torch.sqrt(var)
+
+        return mean, std
+
+    def get_layer_importance(self) -> torch.Tensor:
+        """Return learned layer importance weights."""
+        return self.layer_weights.detach()
 
 
 class RefusalGeometryDiscovery:
@@ -380,8 +629,19 @@ class RefusalGeometryDiscovery:
         self.V_observed = []
         self.R_observed = []
 
-        # GP model
-        if self.config.use_sparse_gp:
+        # GP model selection
+        gp_type = self._resolve_gp_type()
+        if gp_type == 'structured':
+            self.gp = StructuredLayerGP(
+                n_layers=n_layers,
+                hidden_dim=hidden_dim,
+                feature_lengthscale=self.config.feature_lengthscale,
+                layer_lengthscale=self.config.layer_lengthscale,
+                learn_layer_weights=self.config.learn_layer_weights,
+                init_layer_weights=self.config.init_layer_weights,
+                train_steps=self.config.structured_train_steps,
+            )
+        elif gp_type == 'sparse':
             self.gp = AdaptiveSparseGP(
                 kernel_type=self.config.kernel_type,
                 lengthscale=self.config.kernel_lengthscale,
@@ -397,6 +657,64 @@ class RefusalGeometryDiscovery:
                 lengthscale=self.config.kernel_lengthscale
             )
 
+    def _resolve_gp_type(self) -> str:
+        """Resolve GP backend from explicit gp_type with legacy fallback."""
+        gp_type = (self.config.gp_type or '').strip().lower()
+        if gp_type in ('structured', 'sparse', 'simple'):
+            return gp_type
+        return 'sparse' if self.config.use_sparse_gp else 'simple'
+
+    def _estimate_memory_usage(self) -> Dict:
+        """
+        Estimate memory usage for the discovery run.
+
+        Returns:
+            Dict with memory estimates in MB
+        """
+        d = self.n_layers * self.hidden_dim  # Flattened dimension
+        n_total = self.config.n_init_random + self.config.n_iterations
+        m = self.config.n_candidates
+
+        gp_type = self._resolve_gp_type()
+
+        # Effective matrix size depends on GP type
+        if gp_type == 'structured':
+            M = n_total  # Dense but with layer structure
+        elif gp_type == 'sparse':
+            M = self.config.num_inducing
+        else:
+            M = n_total
+
+        bytes_per_float = 4  # float32
+
+        # Candidate storage per iteration
+        candidates_mb = (m * d * bytes_per_float) / (1024 ** 2)
+
+        # GP kernel matrices
+        if gp_type == 'sparse':
+            # Sparse: K_nm [n, M], K_mm [M, M], K_sm [m, M]
+            gp_train_mb = (n_total * M + M * M) * bytes_per_float / (1024 ** 2)
+            gp_predict_mb = (m * M) * bytes_per_float / (1024 ** 2)
+        else:
+            # Dense: K_train [n, n], K_test_train [m, n], K_test_test [m, m]
+            gp_train_mb = (n_total ** 2) * bytes_per_float / (1024 ** 2)
+            gp_predict_mb = (m * n_total + m * m) * bytes_per_float / (1024 ** 2)
+
+        # Observations storage
+        obs_mb = (n_total * d * bytes_per_float) / (1024 ** 2)
+
+        peak_mb = candidates_mb + gp_predict_mb + obs_mb
+
+        return {
+            'candidates_mb': candidates_mb,
+            'gp_train_mb': gp_train_mb,
+            'gp_predict_mb': gp_predict_mb,
+            'observations_mb': obs_mb,
+            'peak_estimate_mb': peak_mb,
+            'dimension': d,
+            'n_observations': n_total,
+        }
+
     def discover(self) -> Dict:
         """
         Run adaptive geometry discovery.
@@ -408,6 +726,24 @@ class RefusalGeometryDiscovery:
         print("Adaptive Geometry Discovery")
         print("=" * 70)
 
+        # Memory estimation and warning
+        mem = self._estimate_memory_usage()
+        gp_type = self._resolve_gp_type()
+        gp_type_str = gp_type.capitalize()
+        if gp_type == 'structured':
+            gp_type_str += f" (layer smoothness σ={self.config.layer_lengthscale}, ARD={self.config.learn_layer_weights})"
+
+        print(f"\nMemory estimate (peak ~{mem['peak_estimate_mb']:.1f} MB):")
+        print(f"  Candidates/iter: {mem['candidates_mb']:.1f} MB ({self.config.n_candidates} × {mem['dimension']} floats)")
+        print(f"  GP predict:      {mem['gp_predict_mb']:.1f} MB")
+        print(f"  Observations:    {mem['observations_mb']:.1f} MB")
+        print(f"  GP type:         {gp_type_str}")
+
+        if mem['peak_estimate_mb'] > 1000:
+            print(f"\n  WARNING: Estimated memory > 1GB. Consider reducing n_candidates.")
+        if gp_type == 'simple' and mem['gp_predict_mb'] > 500:
+            print(f"\n  WARNING: Dense GP will be slow. Set gp_type='sparse' or 'structured'.")
+
         # Phase 1: Random initialization
         print(f"\nPhase 1: Random initialization ({self.config.n_init_random} samples)")
         self._initialize_random()
@@ -415,6 +751,15 @@ class RefusalGeometryDiscovery:
         # Phase 2: Active exploration
         print(f"\nPhase 2: Active exploration ({self.config.n_iterations} iterations)")
         self._active_exploration()
+
+        # Report learned layer importance (if using structured GP)
+        if gp_type == 'structured' and hasattr(self.gp, 'get_layer_importance'):
+            layer_weights = self.gp.get_layer_importance()
+            print("\n  Learned layer importance (ARD):")
+            top_k = min(5, len(layer_weights))
+            top_layers = layer_weights.topk(top_k)
+            for idx, weight in zip(top_layers.indices, top_layers.values):
+                print(f"    Layer {idx.item():2d}: {weight.item():.3f}")
 
         # Phase 3: Geometry extraction
         print("\nPhase 3: Geometry extraction")
@@ -548,9 +893,10 @@ class RefusalGeometryDiscovery:
             scores = improvement * cdf + std * pdf
 
         elif self.config.acquisition_type == 'boundary':
-            # Boundary exploration
+            # Boundary exploration using straddle heuristic
+            # High scores when: (1) high uncertainty AND (2) near threshold crossing
             distance_to_threshold = torch.abs(mean - self.config.boundary_threshold)
-            scores = -distance_to_threshold * std  # Want high uncertainty near threshold
+            scores = self.config.beta * std - distance_to_threshold
 
         else:
             raise ValueError(f"Unknown acquisition: {self.config.acquisition_type}")
@@ -710,26 +1056,27 @@ if __name__ == '__main__':
     print("Adaptive Geometry Discovery - Demo")
     print("=" * 70)
 
-    # Mock refusal measurement function
+    # Using smaller dimensions for fast demo
+    demo_n_layers = 4
+    demo_hidden_dim = 256
+
+    # Fixed "true" directions for reproducible demo
+    torch.manual_seed(42)
+    TRUE_DIR1 = torch.randn(demo_n_layers, demo_hidden_dim)
+    TRUE_DIR1 = TRUE_DIR1 / TRUE_DIR1.norm(dim=1, keepdim=True)
+    TRUE_DIR2 = torch.randn(demo_n_layers, demo_hidden_dim)
+    TRUE_DIR2 = TRUE_DIR2 / TRUE_DIR2.norm(dim=1, keepdim=True)
+
     def mock_measure_refusal(v: torch.Tensor) -> float:
         """
         Mock refusal strength measurement.
 
         Simulates a refusal subspace with:
         - 2 principal modes (two different refusal directions)
-        - Intrinsic dimension ~3
         """
-        # Define two "true" refusal directions
-        true_dir1 = torch.randn(26, 2048)
-        true_dir1 = true_dir1 / true_dir1.norm(dim=1, keepdim=True)
-
-        true_dir2 = torch.randn(26, 2048)
-        true_dir2 = true_dir2 / true_dir2.norm(dim=1, keepdim=True)
-
-        # Measure alignment with true directions
         v_flat = v.reshape(-1)
-        dir1_flat = true_dir1.reshape(-1)
-        dir2_flat = true_dir2.reshape(-1)
+        dir1_flat = TRUE_DIR1.reshape(-1)
+        dir2_flat = TRUE_DIR2.reshape(-1)
 
         alignment1 = (v_flat @ dir1_flat) / (v_flat.norm() * dir1_flat.norm())
         alignment2 = (v_flat @ dir2_flat) / (v_flat.norm() * dir2_flat.norm())
@@ -743,20 +1090,13 @@ if __name__ == '__main__':
 
         return R
 
-    # Run discovery
-    config = GeometryConfig(
-        n_init_random=10,  # Small for demo
-        n_iterations=20,
-        n_candidates=100,
-        acquisition_type='ucb',
-        beta=2.0
-    )
+    # Run discovery with defaults (now sane: sparse GP, 100 candidates, 30 iterations)
 
     discovery = RefusalGeometryDiscovery(
         measure_refusal_fn=mock_measure_refusal,
-        n_layers=26,
-        hidden_dim=2048,
-        config=config
+        n_layers=demo_n_layers,
+        hidden_dim=demo_hidden_dim,
+        # config=GeometryConfig()  # Uses sane defaults
     )
 
     results = discovery.discover()

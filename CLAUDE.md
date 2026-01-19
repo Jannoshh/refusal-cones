@@ -21,9 +21,10 @@ This codebase enables you to:
 4. **Scale Efficiently** - Use PEFT adapters instead of custom implementations (97% less code)
 
 ### Latest updates
-- Gradient/adaptive discovery now support configurable kernels and optional sparse GP (adaptive inducing points). Enable via `use_sparse_gp=True`, tune `kernel_type`, `kernel_lengthscale`, `num_inducing`, etc.
-- New fast CPU tests cover discovery, sparse GP, and loss alignment; run with `pytest -q` (use `. .venv/bin/activate` first). No GPU required.
-- E1 efficiency script exposes flags for the above (`--use_sparse_gp`, `--kernel`, `--lengthscale`, `--num_inducing`, `--sparse_steps`, `--sparse_lr`).
+- **Structured GP (default)**: New `gp_type='structured'` models layer dependencies with smoothness + ARD. Automatically learns which layers matter for refusal.
+- **Sane defaults**: Reduced `n_candidates` (1000→100), `n_iterations` (100→30) to prevent OOM. Memory warning printed before discovery.
+- Gradient/adaptive discovery support three GP types: `'structured'` (recommended), `'sparse'`, `'simple'`.
+- New fast CPU tests cover discovery, sparse GP, and loss alignment; run with `uv run pytest -q`. No GPU required.
 
 ### Key Innovation: Gradient-Based Adaptive Discovery
 
@@ -47,16 +48,12 @@ Instead of assuming refusal is a simple cone (linear subspace), we:
 git clone <repo-url>
 cd refusal-cones
 
-# Create and activate virtual environment with uv
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+# Install dependencies with uv (creates .venv automatically)
+uv sync
 
-# Install dependencies
-uv pip install torch transformers peft datasets
-uv pip install scikit-learn scipy numpy matplotlib
-
-# For HarmBench evaluation (optional)
-uv pip install harmbench
+# Run commands with uv run (no need to activate venv)
+uv run python -m src.discovery.gradient_discovery
+uv run pytest -q
 ```
 
 ### Basic Usage
@@ -75,7 +72,7 @@ refusal_direction = mean(activations_harmful) - mean(activations_harmless)
 
 ```bash
 # Run the full pipeline for your model
-python3 -m refusal_direction.pipeline.run_pipeline --model_path meta-llama/Llama-2-7b-chat-hf
+python3 -m refusal_direction.pipeline.run_pipeline --model_path Qwen/Qwen3-0.6B
 
 # This will:
 # 1. Generate candidate directions (mean diff at each layer/position)
@@ -91,11 +88,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Load model
 model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf",
+    "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
 # Example prompts (use larger datasets for better results)
 harmful_prompts = [
@@ -175,7 +172,7 @@ import torch
 
 # Load refusal vector computed in Step 0
 v_init = torch.load("refusal_vector.pt")  # [n_layers, hidden_dim]
-# Or from the pipeline: torch.load("refusal_direction/pipeline/runs/llama-2-7b-chat-hf/direction.pt")
+# Or from the pipeline: torch.load("refusal_direction/pipeline/runs/qwen3-0.6b/direction.pt")
 
 # Define measurement function
 def measure_refusal_with_grad(v: torch.Tensor) -> tuple:
@@ -218,8 +215,8 @@ config = GradientDiscoveryConfig(
 discovery = GradientGeometryDiscovery(
     measure_refusal_with_grad=measure_refusal_with_grad,
     v_init=v_init,
-    n_layers=26,  # For Llama-2-7B
-    hidden_dim=2048,
+    n_layers=28,  # For Qwen3-0.6B
+    hidden_dim=1024,
     config=config
 )
 
@@ -261,7 +258,7 @@ from transformers import AutoModelForCausalLM
 
 # Load base model
 base_model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf",
+    "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
@@ -299,7 +296,7 @@ harmless_data = load_harmless_dataset()  # Your helpful examples
 
 # Train with RDO
 trained_model, trainer = train_rdo_with_peft(
-    model_name="meta-llama/Llama-2-7b-chat-hf",
+    model_name="Qwen/Qwen3-0.6B",
     harmful_data=harmful_data,
     harmless_data=harmless_data,
     output_dir="rdo_adapters",
@@ -325,7 +322,7 @@ trained_model.save_pretrained("final_adapters")
 from peft import PeftModel
 
 model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf",
+    "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
@@ -383,7 +380,11 @@ refusal-cones/
 **Discovery** (in `src/discovery/`):
 - `gradient_discovery.py` - Gradient-based discovery (RECOMMENDED)
 - `efficient_discovery.py` - Pure GP with efficiency strategies
-- `adaptive_geometry_discovery.py` - Base GP implementation
+- `adaptive_geometry_discovery.py` - Base GP implementation with three GP types:
+  - `StructuredLayerGP` - Layer smoothness + ARD (default, recommended)
+  - `AdaptiveSparseGP` - Sparse inducing points for scaling
+  - `SimpleGP` - Basic dense GP
+- `boundary_discovery.py` - Boundary/level-set discovery with straddle acquisition
 
 **Training** (in `src/training/`):
 - `rdo_peft_adapter.py` - PEFT adapters for projection
@@ -451,6 +452,59 @@ v = v / ||v||                       # Retract to sphere
 ```
 
 **Why this matters:** 10× fewer measurements to find local maxima!
+
+### 5. GP Types and Layer Structure
+
+The discovery searches over `[n_layers, hidden_dim]` matrices - a different direction per layer. Three GP types handle this high-dimensional space differently:
+
+#### Simple GP (`gp_type='simple'`)
+- Flattens to single vector, treats all dimensions equally
+- No layer structure encoded
+- O(n³) complexity, doesn't scale
+
+#### Sparse GP (`gp_type='sparse'`)
+- Uses M inducing points (default 64) for O(nM²) complexity
+- Still flattens - no layer structure
+- Good for scaling, but ignores layer relationships
+
+#### Structured GP (`gp_type='structured'`) - **RECOMMENDED**
+- Models **layer smoothness**: adjacent layers have correlated directions
+- **ARD (Automatic Relevance Determination)**: learns which layers matter
+- Kernel factorizes as: `K(v,v') = Σᵢⱼ wᵢwⱼ K_layer(i,j) K_feature(v[i], v'[j])`
+
+```python
+# Configure structured GP
+config = GeometryConfig(
+    gp_type='structured',
+    layer_lengthscale=3.0,        # Smoothness across ~3 adjacent layers
+    feature_lengthscale=1.0,      # RBF lengthscale for features
+    init_layer_weights='middle',  # Start with middle-layer bias
+    learn_layer_weights=True,     # Learn importance via marginal likelihood
+)
+```
+
+**How ARD learns layer importance:**
+
+The GP optimizes layer weights `w_i` to maximize marginal likelihood of observed data:
+
+```
+log p(R_observed | V_observed, w) = data_fit - complexity_penalty
+```
+
+- If layer i doesn't affect R → variations at layer i don't help prediction → `w_i → 0`
+- If layer i matters → variations correlate with R → `w_i` stays large
+
+This is learned jointly from all observations - no need to test layers individually.
+
+**Example output:**
+```
+Learned layer importance (ARD):
+  Layer 12: 2.341   ← middle layers dominate
+  Layer 13: 1.892
+  Layer 11: 1.456
+  Layer 14: 0.891
+  Layer  0: 0.023   ← early/late layers less important
+```
 
 ## Workflows
 
@@ -543,17 +597,20 @@ See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadma
 
 ### Out of memory
 
-**Problem:** GPU OOM during discovery/training
+**Problem:** GPU/CPU OOM during discovery/training
 
 **Solutions:**
-- Use `fp16=True` (half precision)
+- Check the memory estimate printed at discovery start
+- Reduce `n_candidates` (default: 100, was 1000 in old versions)
+- Use `gp_type='sparse'` or `gp_type='structured'` (not `'simple'`)
+- Reduce `n_iterations` (default: 30)
+- Use `fp16=True` (half precision) for training
 - Reduce batch size
 - Use gradient checkpointing
-- Smaller model or fewer layers
 
 ## Performance Benchmarks
 
-### Discovery (Llama-2-7B on A100)
+### Discovery (Qwen3-0.6B on A100)
 
 | Method | Measurements | Time | Max R Found |
 |--------|-------------|------|-------------|
@@ -561,7 +618,7 @@ See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadma
 | Pure GP | 500 | 4 hours | 0.78 |
 | **Gradient + GP + Prior** | **50-70** | **25 min** | **0.85** |
 
-### Training (Llama-2-7B on A100)
+### Training (Qwen3-0.6B on A100)
 
 | Initialization | Convergence | Final ASR | Time |
 |---------------|-------------|-----------|------|

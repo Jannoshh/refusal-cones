@@ -355,7 +355,7 @@ def discover_refusal_geometry(
 
     for iteration in range(n_iterations):
         # Sample candidate directions
-        n_candidates = 1000
+        n_candidates = 100  # Reduced default (was 1000) to prevent OOM
         candidates = torch.randn(n_candidates, n_layers, hidden_dim)
         candidates = candidates / candidates.norm(dim=1, keepdim=True)
 
@@ -652,3 +652,89 @@ Instead of fixed cones:
 - ⚠ Need to define refusal strength metric
 
 **Recommendation:** Use for research/analysis to understand refusal geometry, then can simplify to fixed cone if geometry is simple.
+
+## 11. Implementation: GP Types and Layer Structure
+
+The actual implementation in `src/discovery/adaptive_geometry_discovery.py` provides three GP types:
+
+### GP Type Comparison
+
+| GP Type | Layer Structure | Complexity | Use Case |
+|---------|-----------------|------------|----------|
+| `'structured'` | Smoothness + ARD | O(n³) layer-aware | **Default, recommended** |
+| `'sparse'` | None (flattens) | O(nM²) | Large-scale discovery |
+| `'simple'` | None (flattens) | O(n³) | Baseline only |
+
+### Structured GP: Layer Smoothness + ARD
+
+The **StructuredLayerGP** models layer dependencies explicitly:
+
+1. **Layer smoothness**: Adjacent layers have correlated directions
+   ```
+   K_layer[i,j] = exp(-|i-j|² / 2σ_layer²)
+   ```
+
+2. **ARD (Automatic Relevance Determination)**: Learns which layers matter
+   ```
+   K(v, v') = Σᵢⱼ wᵢ wⱼ K_layer(i,j) K_feature(v[i], v'[j])
+   ```
+
+   Layer weights `wᵢ` are learned by maximizing marginal likelihood.
+
+**How ARD learns layer importance:**
+
+The GP optimizes layer weights to maximize `log p(R_observed | V_observed, w)`:
+- Layers that don't affect R → weight goes to 0
+- Layers that matter → weight stays large
+
+This is learned jointly from all observations, not by testing layers individually.
+
+**Example output:**
+```
+Learned layer importance (ARD):
+  Layer 14: 2.341   ← middle layers dominate
+  Layer 13: 1.892
+  Layer 15: 1.456
+  Layer 12: 0.891
+  Layer  0: 0.023   ← early/late layers less important
+```
+
+### Configuration
+
+```python
+from src.discovery import GeometryConfig, RefusalGeometryDiscovery
+
+config = GeometryConfig(
+    # GP type selection
+    gp_type='structured',           # 'structured', 'sparse', or 'simple'
+
+    # Structured GP settings
+    layer_lengthscale=3.0,          # Smoothness across ~3 adjacent layers
+    feature_lengthscale=1.0,        # RBF for features within each layer
+    init_layer_weights='middle',    # 'middle', 'uniform', or 'learned'
+    learn_layer_weights=True,       # ARD: learn which layers matter
+
+    # Exploration settings (reduced defaults to prevent OOM)
+    n_candidates=100,               # Was 1000
+    n_iterations=30,                # Was 100
+    n_init_random=10,               # Initial random samples
+)
+
+discovery = RefusalGeometryDiscovery(
+    measure_refusal_fn=measure_fn,
+    n_layers=28,
+    hidden_dim=1024,
+    config=config
+)
+```
+
+### Memory Warning
+
+Discovery now prints a memory estimate before running:
+```
+Memory estimate (peak ~X.X MB):
+  Candidates/iter: X.X MB (100 × 28672 floats)
+  GP predict:      X.X MB
+  Observations:    X.X MB
+  GP type:         Structured (layer smoothness σ=3.0, ARD=True)
+```
