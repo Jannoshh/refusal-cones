@@ -29,7 +29,7 @@ from transformers import (
 from typing import Dict, Optional
 from datasets import Dataset
 
-from projection_adapter import get_projection_model, ProjectionConfig
+from .projection_adapter import get_projection_model, ProjectionConfig
 
 
 class SmoothMaxProjectionTrainer(Trainer):

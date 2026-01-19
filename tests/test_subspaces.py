@@ -1,14 +1,29 @@
 # %%
+"""
+NOTE: This file is a notebook/script for interactive analysis, not a pytest test file.
+It is skipped during test collection.
+"""
+import sys
+import os
+
+# Skip this module during pytest collection - it's a script, not a test file
+if "pytest" in sys.modules:
+    import pytest
+    pytest.skip("Skipping notebook/script file", allow_module_level=True)
+
 import torch
 import torch.nn as nn
 import json
 from torch import Tensor
 from jaxtyping import Float
 from tqdm import tqdm
-import os
-import wandb
 import argparse
-import sys
+
+# wandb is optional
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 def parse_args():
     # Default values

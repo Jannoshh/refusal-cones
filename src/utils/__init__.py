@@ -1,8 +1,18 @@
 """Utility functions for model handling and generation."""
 
-from .model_utils import load_model, apply_projection_hook
-from .generate_utils import generate_with_projection
-from .conversion_utils import convert_nnsight_to_pytorch
+from .model_utils import HookedModel, get_layer_activations, apply_intervention_to_layers
+from .generate_utils import (
+    projection_einops,
+    generate_completions,
+    intervene_with_fn_vector_ablation,
+    intervene_with_fn_vector_addition
+)
+from .conversion_utils import (
+    get_projection_matrix,
+    VectorModifiedLayer,
+    convert_model_to_vector_modified,
+    get_trainable_vector_parameters
+)
 from .data_utils import (
     load_cb_harmful_train,
     load_harmless_data,
@@ -11,10 +21,17 @@ from .data_utils import (
 )
 
 __all__ = [
-    'load_model',
-    'apply_projection_hook',
-    'generate_with_projection',
-    'convert_nnsight_to_pytorch',
+    'HookedModel',
+    'get_layer_activations',
+    'apply_intervention_to_layers',
+    'projection_einops',
+    'generate_completions',
+    'intervene_with_fn_vector_ablation',
+    'intervene_with_fn_vector_addition',
+    'get_projection_matrix',
+    'VectorModifiedLayer',
+    'convert_model_to_vector_modified',
+    'get_trainable_vector_parameters',
     'load_cb_harmful_train',
     'load_harmless_data',
     'prepare_rdo_datasets',

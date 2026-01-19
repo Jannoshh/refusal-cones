@@ -1,23 +1,27 @@
 """Training modules for refusal vectors."""
 
-from .rdo_peft_adapter import (
-    RDOConfig,
-    get_rdo_model,
-    get_cone_model,
-    set_operation_mode
+from .rdo_peft_adapter import RDOConfig, get_rdo_model
+from .rdo_peft_trainer import train_rdo_with_peft, RDOTrainer
+from .projection_adapter import ProjectionConfig, ProjectionLayer, get_projection_model
+from .per_layer_training import (
+    PerLayerRefusalVectors,
+    train_per_layer_vectors,
+    smooth_max_loss,
+    weighted_smooth_max_loss
 )
-from .rdo_peft_trainer import train_rdo_with_peft
-from .projection_adapter import ProjectionAdapter
-from .per_layer_training import train_per_layer_vectors
 from .sft_peft_trainer import train_sft_with_peft
 
 __all__ = [
     'RDOConfig',
     'get_rdo_model',
-    'get_cone_model',
-    'set_operation_mode',
     'train_rdo_with_peft',
-    'ProjectionAdapter',
+    'RDOTrainer',
+    'ProjectionConfig',
+    'ProjectionLayer',
+    'get_projection_model',
+    'PerLayerRefusalVectors',
     'train_per_layer_vectors',
+    'smooth_max_loss',
+    'weighted_smooth_max_loss',
     'train_sft_with_peft'
 ]

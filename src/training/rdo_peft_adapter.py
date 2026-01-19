@@ -15,7 +15,7 @@ from typing import Optional, List, Literal
 from dataclasses import dataclass, field
 import copy
 
-from projection_adapter import ProjectionConfig, ProjectionLayer
+from .projection_adapter import ProjectionConfig, ProjectionLayer
 
 
 @dataclass

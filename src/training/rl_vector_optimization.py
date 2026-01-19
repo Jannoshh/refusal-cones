@@ -22,8 +22,8 @@ import numpy as np
 from tqdm import tqdm
 import json
 
-from per_layer_training import PerLayerRefusalVectors, apply_per_layer_ablation
-from scoring import get_refusal_scores
+from .per_layer_training import PerLayerRefusalVectors, apply_per_layer_ablation
+from measurement.scoring import get_refusal_scores
 
 
 class VectorPolicyGradient(nn.Module):

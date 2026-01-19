@@ -97,7 +97,7 @@ class PerLayerRefusalVectors(nn.Module):
         n_layers: int,
         hidden_dim: int,
         init_vectors: Optional[List[Tensor]] = None,
-        device: str = 'cuda',
+        device: Optional[str] = None,
         dtype: torch.dtype = torch.float32
     ):
         """
@@ -113,6 +113,14 @@ class PerLayerRefusalVectors(nn.Module):
         super().__init__()
         self.n_layers = n_layers
         self.hidden_dim = hidden_dim
+        # Auto-detect device if not specified
+        if device is None:
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
         self.device = device
         self.dtype = dtype
 
