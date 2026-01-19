@@ -109,11 +109,13 @@ def prepare_unified_dataset(
     """
     Prepare dataset for unified RDO training.
 
+    Uses tokenizer.apply_chat_template for proper formatting.
+
     Key difference: Only need refusal completions (not harmful completions)
     because the affine transformation handles both ablation and addition.
 
     Args:
-        tokenizer: Tokenizer
+        tokenizer: Tokenizer (must support apply_chat_template)
         harmful_data: Harmful prompts with refusal completions
         harmless_data: Harmless prompts with helpful completions
         max_length: Max sequence length
@@ -128,8 +130,18 @@ def prepare_unified_dataset(
         instruction = item['instruction']
         refusal = item['refusal_completion']
 
-        # We want: affine_transform(harmful_prompt) → refusal
-        text = f"<start_of_turn>user\n{instruction}<end_of_turn>\n<start_of_turn>model\n{refusal}<end_of_turn>"
+        # Format with chat template
+        messages = [
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": refusal}
+        ]
+
+        # Use apply_chat_template for proper formatting
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
 
         examples.append({
             'text': text,
@@ -141,7 +153,16 @@ def prepare_unified_dataset(
         instruction = item['instruction']
         completion = item['completion']
 
-        text = f"<start_of_turn>user\n{instruction}<end_of_turn>\n<start_of_turn>model\n{completion}<end_of_turn>"
+        messages = [
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": completion}
+        ]
+
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
 
         examples.append({
             'text': text,

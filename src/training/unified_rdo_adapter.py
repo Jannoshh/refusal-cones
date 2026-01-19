@@ -549,7 +549,19 @@ class UnifiedRDOModel(nn.Module):
         with torch.no_grad():
             for i in range(0, len(harmless_prompts), batch_size):
                 batch = harmless_prompts[i:i+batch_size]
-                inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+
+                # Format with chat template
+                formatted_batch = []
+                for prompt in batch:
+                    messages = [{"role": "user", "content": prompt}]
+                    formatted = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    formatted_batch.append(formatted)
+
+                inputs = tokenizer(formatted_batch, return_tensors='pt', padding=True, truncation=True)
                 inputs = {k: v.to(self.base_model.device) for k, v in inputs.items()}
                 _ = self.base_model(**inputs)
 
@@ -562,7 +574,19 @@ class UnifiedRDOModel(nn.Module):
         with torch.no_grad():
             for i in range(0, len(harmful_prompts), batch_size):
                 batch = harmful_prompts[i:i+batch_size]
-                inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+
+                # Format with chat template
+                formatted_batch = []
+                for prompt in batch:
+                    messages = [{"role": "user", "content": prompt}]
+                    formatted = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    formatted_batch.append(formatted)
+
+                inputs = tokenizer(formatted_batch, return_tensors='pt', padding=True, truncation=True)
                 inputs = {k: v.to(self.base_model.device) for k, v in inputs.items()}
                 _ = self.base_model(**inputs)
 

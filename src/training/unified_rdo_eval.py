@@ -181,7 +181,7 @@ class UnifiedRDOEvaluator:
         Generate responses for prompts.
 
         Args:
-            prompts: List of prompts
+            prompts: List of prompts (plain text, will be formatted with chat template)
             max_new_tokens: Max tokens to generate
             batch_size: Batch size for generation
             temperature: Sampling temperature
@@ -197,9 +197,21 @@ class UnifiedRDOEvaluator:
             for i in range(0, len(prompts), batch_size):
                 batch = prompts[i:i+batch_size]
 
+                # Format with chat template
+                formatted_batch = []
+                for prompt in batch:
+                    messages = [{"role": "user", "content": prompt}]
+                    # Use apply_chat_template for proper formatting
+                    formatted = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True  # Add prompt for model to respond
+                    )
+                    formatted_batch.append(formatted)
+
                 # Tokenize
                 inputs = self.tokenizer(
-                    batch,
+                    formatted_batch,
                     return_tensors='pt',
                     padding=True,
                     truncation=True,

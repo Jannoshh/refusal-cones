@@ -146,7 +146,7 @@ class UnifiedRDOTrainerWithEval(UnifiedRDOTrainer):
 
 
 def train_with_validation(
-    model_name: str = "google/gemma-2-2b-it",
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
     output_dir: str = "unified_rdo_trained",
     n_train_harmful: int = 1000,
     n_train_harmless: int = 1000,
@@ -369,7 +369,7 @@ def main():
     print("-" * 70)
 
     config = {
-        'model_name': 'gpt2',  # Use small model for demo
+        'model_name': 'Qwen/Qwen2.5-0.5B-Instruct',  # Small, fast model for demo
         'output_dir': 'unified_rdo_demo',
         'n_train_harmful': 100,
         'n_train_harmless': 100,

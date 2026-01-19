@@ -24,11 +24,13 @@ from dataclasses import dataclass
 # Refusal tokens for different models
 # These are typically the token for "I" which starts refusals like "I cannot", "I'm sorry"
 REFUSAL_TOKENS = {
-    'llama-2': [306],  # 'I'
-    'llama-3': [40],   # 'I'
-    'gemma': [235285], # 'I'
-    'qwen': [40],      # 'I'
-    'yi': [40],        # 'I'
+    'llama-2': [306],     # 'I'
+    'llama-3': [40],      # 'I'
+    'gemma': [235285],    # 'I'
+    'qwen': [40],         # 'I' (Qwen2.5 uses similar tokenizer to Llama)
+    'qwen2': [40],        # 'I'
+    'qwen2.5': [40],      # 'I'
+    'yi': [40],           # 'I'
 }
 
 
@@ -37,7 +39,7 @@ def get_refusal_tokens(model_name: str, tokenizer) -> List[int]:
     Get refusal token IDs for a model.
 
     Args:
-        model_name: Model name (e.g., "meta-llama/Llama-2-7b-chat-hf")
+        model_name: Model name (e.g., "Qwen/Qwen2.5-0.5B-Instruct")
         tokenizer: Tokenizer
 
     Returns:
@@ -52,6 +54,10 @@ def get_refusal_tokens(model_name: str, tokenizer) -> List[int]:
         return REFUSAL_TOKENS['llama-3']
     elif 'gemma' in model_name_lower:
         return REFUSAL_TOKENS['gemma']
+    elif 'qwen2.5' in model_name_lower or 'qwen-2.5' in model_name_lower:
+        return REFUSAL_TOKENS['qwen2.5']
+    elif 'qwen2' in model_name_lower or 'qwen-2' in model_name_lower:
+        return REFUSAL_TOKENS['qwen2']
     elif 'qwen' in model_name_lower:
         return REFUSAL_TOKENS['qwen']
     elif 'yi' in model_name_lower:
@@ -193,7 +199,7 @@ class RefusalTokenEvaluator:
         Get refusal scores for prompts.
 
         Args:
-            prompts: List of prompts
+            prompts: List of prompts (plain text, will be formatted with chat template)
             batch_size: Batch size
 
         Returns:
@@ -206,9 +212,21 @@ class RefusalTokenEvaluator:
             for i in range(0, len(prompts), batch_size):
                 batch = prompts[i:i+batch_size]
 
+                # Format with chat template
+                formatted_batch = []
+                for prompt in batch:
+                    messages = [{"role": "user", "content": prompt}]
+                    # Use apply_chat_template for proper formatting
+                    formatted = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True  # Add prompt for model to respond
+                    )
+                    formatted_batch.append(formatted)
+
                 # Tokenize
                 inputs = self.tokenizer(
-                    batch,
+                    formatted_batch,
                     return_tensors='pt',
                     padding=True,
                     truncation=True,
