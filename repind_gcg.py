@@ -51,10 +51,8 @@ print(message)
 #     {"role": "user", "content": goal + ' {optim_str}'},
 # ]
 # %%
-from nnsight import LanguageModel
-dtype = torch.bfloat16
-nnsight_model = LanguageModel(model_id, cache_dir=CACHE_DIR, device_map='auto', torch_dtype=dtype)
-nnsight_model.requires_grad_(False)
+# Note: We already have the model loaded above using AutoModelForCausalLM
+# The nnsight_model is no longer needed as we'll use hooks directly
 # %%
 import einops
 def projection_einops(activation, direction):
@@ -68,18 +66,61 @@ def projection_einops(activation, direction):
 
 @torch.no_grad()
 def get_activations(model, prompt, intervention_vector):
+    """
+    Get activations from all layers with directional ablation applied.
+
+    Args:
+        model: HuggingFace model
+        prompt: String prompt
+        intervention_vector: Direction vector to ablate
+
+    Returns:
+        Tensor of shape (num_layers, batch_size, seq_len, hidden_dim)
+    """
     activations = []
-    # if intervention_vector is not None and intervention_vector.norm() > 0:
-    #     intervention_vector = intervention_vector / intervention_vector.norm() 
-    with model.trace([prompt]) as _:
-        for layer in model.model.layers:
-            act = layer.input
+
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors='pt').to(model.device)
+
+    # Storage for layer activations
+    layer_acts = []
+
+    def create_hook(layer_idx):
+        def hook(module, input, output):
+            # Get the activation (handle tuple outputs)
+            if isinstance(output, tuple):
+                act = output[0]
+            else:
+                act = output
+
+            # Apply ablation
             ablated_act = act - projection_einops(act, intervention_vector)
-            layer.input = ablated_act 
-            layer.self_attn.output[0][:] -= projection_einops(layer.self_attn.output[0][:], intervention_vector)
-            layer.mlp.output[:] -= projection_einops(layer.mlp.output[:], intervention_vector)
-            activations.append(ablated_act.save())
-    return torch.stack([a.value for a in activations])
+
+            # Store the ablated activation
+            layer_acts.append(ablated_act.detach().cpu())
+
+            # Return the ablated activation
+            if isinstance(output, tuple):
+                return (ablated_act,) + output[1:]
+            else:
+                return ablated_act
+        return hook
+
+    # Register hooks on each layer
+    handles = []
+    for idx, layer in enumerate(model.model.layers):
+        handle = layer.register_forward_hook(create_hook(idx))
+        handles.append(handle)
+
+    # Forward pass
+    _ = model(**inputs)
+
+    # Clean up hooks
+    for handle in handles:
+        handle.remove()
+
+    # Stack activations
+    return torch.stack(layer_acts)
 
 # %%
 prompt = f"""<start_of_turn>user
@@ -97,7 +138,7 @@ refusal_vector = torch.load("results/refusal_dir/gemma-2-2b-it/direction.pt").to
 repind_vector = torch.load("lowest_loss_vector (1).pt").to(torch.bfloat16)
 repind_vector = repind_vector / repind_vector.norm()
 # repind_vector = refusal_vector / refusal_vector.norm()
-activations = get_activations(nnsight_model, prompt, repind_vector)
+activations = get_activations(model, prompt, repind_vector)
 activations.shape
 
 # %%
@@ -175,11 +216,11 @@ without_suffix = f"""<start_of_turn>user
 {goal}<end_of_turn>
 <start_of_turn>model
 """
-after_activations = get_activations(nnsight_model, with_suffix, torch.zeros_like(repind_vector).cuda())
+after_activations = get_activations(model, with_suffix, torch.zeros_like(repind_vector).cuda())
 cosine_sim = []
 for activation in after_activations:
     cosine_sim.append(torch.nn.functional.cosine_similarity(activation[0, -1].cuda(), repind_vector.cuda(), dim=-1))
-baseline_activations = get_activations(nnsight_model, without_suffix, torch.zeros_like(repind_vector).cuda())
+baseline_activations = get_activations(model, without_suffix, torch.zeros_like(repind_vector).cuda())
 baseline_cosine_sim = []
 for activation in baseline_activations:
     baseline_cosine_sim.append(torch.nn.functional.cosine_similarity(activation[0, -1].cuda(), repind_vector.cuda(), dim=-1))

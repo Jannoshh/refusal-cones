@@ -72,14 +72,17 @@ CACHE_DIR = '/ceph/hdd/students/elsj/huggingface'
 assert "gemma" in MODEL_PATH.lower() or "qwen2.5" in MODEL_PATH.lower() or "llama-3" in MODEL_PATH.lower(), "Model not supported"
 
 # %%
-from nnsight import LanguageModel
+# NOTE: This is an old version of directopt.py that has been partially ported.
+# Complex training code using nnsight's advanced features needs manual review.
+from transformers import AutoModelForCausalLM, AutoTokenizer
 dtype = torch.bfloat16
-model = LanguageModel(MODEL_PATH, cache_dir=CACHE_DIR, device_map='auto', torch_dtype=dtype)
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, cache_dir=CACHE_DIR, device_map='auto', torch_dtype=dtype)
+model.tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, cache_dir=CACHE_DIR)
 model.requires_grad_(False)
 
 # %%
-with model.trace("Hello") as tracer:
-    pass
+# Test that model works (no longer need trace for this)
+_ = model.tokenizer("Hello", return_tensors='pt')
 
 # %%
 model_id = MODEL_PATH.split("/")[-1]
