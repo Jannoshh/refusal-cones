@@ -238,3 +238,12 @@ fabric.properties
 
 wandb/
 wandb_downloads/
+
+# macOS
+.DS_Store
+
+# Results and artifacts
+*.png
+*.pt
+*_results.txt
+evaluation_results.json
