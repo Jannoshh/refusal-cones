@@ -369,7 +369,7 @@ def select_batch(candidates, batch_size):
 If you've explored refusal for similar model:
 
 ```python
-# Previously explored Llama-2-7B
+# Previously explored Qwen3-0.6B
 results_7b = load("llama2_7b_discovery.pkl")
 
 # Now exploring Llama-2-13B (similar geometry!)
@@ -530,7 +530,7 @@ GP-UCB                 500        5min    95%
 GP-UCB + PCA reduction 200        2min    97%
 ```
 
-### Real Model (Llama-2-7B, d=53,248)
+### Real Model (Qwen3-0.6B, d=53,248)
 
 ```
 Method                 Measurements    Discovery Quality

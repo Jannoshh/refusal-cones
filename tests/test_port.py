@@ -14,9 +14,11 @@ SRC_DIR = Path(__file__).parent.parent / "src"
 def test_imports():
     """Test that all necessary imports work."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from src.measurement import scoring
+    from src.measurement.scoring import refusal_score, get_logits
     from src.utils import generate_utils
     assert AutoModelForCausalLM and AutoTokenizer  # basic import smoke
+    assert callable(refusal_score)
+    assert callable(get_logits)
 
 def test_scoring_functions():
     """Test that scoring functions are correctly defined."""

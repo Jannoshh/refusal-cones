@@ -348,7 +348,7 @@ def main():
     print("\n1. Quick start:")
     print("   from src.training.unified_rdo_trainer import train_unified_rdo")
     print("   model, trainer = train_unified_rdo(")
-    print("       model_name='meta-llama/Llama-2-7b-chat-hf',")
+    print("       model_name='Qwen/Qwen3-0.6B',")
     print("       harmful_data=your_harmful_data,")
     print("       harmless_data=your_harmless_data,")
     print("       projection_alpha=1.0,  # Full ablation")

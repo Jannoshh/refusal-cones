@@ -353,7 +353,7 @@ With UCB and β = O(√log T):
 
 **We don't need to sample the entire hypersphere - GP guides us to important regions!**
 
-## Example: Discovery on Llama-2-7B
+## Example: Discovery on Qwen3-0.6B
 
 ```python
 # Define refusal measurement

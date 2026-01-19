@@ -68,7 +68,7 @@ refusal_direction = mean(activations_harmful) - mean(activations_harmless)
 
 ```bash
 # Run the full pipeline for your model
-python3 -m refusal_direction.pipeline.run_pipeline --model_path meta-llama/Llama-2-7b-chat-hf
+python3 -m refusal_direction.pipeline.run_pipeline --model_path Qwen/Qwen3-0.6B
 
 # This will:
 # 1. Generate candidate directions (mean diff at each layer/position)
@@ -84,11 +84,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Load model
 model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf",
+    "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
 # Example prompts (use larger datasets for better results)
 harmful_prompts = [
@@ -168,7 +168,7 @@ import torch
 
 # Load refusal vector computed in Step 0
 v_init = torch.load("refusal_vector.pt")  # [n_layers, hidden_dim]
-# Or from the pipeline: torch.load("refusal_direction/pipeline/runs/llama-2-7b-chat-hf/direction.pt")
+# Or from the pipeline: torch.load("refusal_direction/pipeline/runs/qwen3-0.6b/direction.pt")
 
 # Define measurement function
 def measure_refusal_with_grad(v: torch.Tensor) -> tuple:
@@ -211,8 +211,8 @@ config = GradientDiscoveryConfig(
 discovery = GradientGeometryDiscovery(
     measure_refusal_with_grad=measure_refusal_with_grad,
     v_init=v_init,
-    n_layers=26,  # For Llama-2-7B
-    hidden_dim=2048,
+    n_layers=28,  # For Qwen3-0.6B
+    hidden_dim=1024,
     config=config
 )
 
@@ -254,7 +254,7 @@ from transformers import AutoModelForCausalLM
 
 # Load base model
 base_model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf",
+    "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
@@ -292,7 +292,7 @@ harmless_data = load_harmless_dataset()  # Your helpful examples
 
 # Train with RDO
 trained_model, trainer = train_rdo_with_peft(
-    model_name="meta-llama/Llama-2-7b-chat-hf",
+    model_name="Qwen/Qwen3-0.6B",
     harmful_data=harmful_data,
     harmless_data=harmless_data,
     output_dir="rdo_adapters",
@@ -318,7 +318,7 @@ trained_model.save_pretrained("final_adapters")
 from peft import PeftModel
 
 model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf",
+    "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
@@ -739,7 +739,7 @@ See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadma
 
 ## Performance Benchmarks
 
-### Discovery (Llama-2-7B on A100)
+### Discovery (Qwen3-0.6B on A100)
 
 | Method | Measurements | Time | Max R Found |
 |--------|-------------|------|-------------|
@@ -747,7 +747,7 @@ See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadma
 | Pure GP | 500 | 4 hours | 0.78 |
 | **Gradient + GP + Prior** | **50-70** | **25 min** | **0.85** |
 
-### Training (Llama-2-7B on A100)
+### Training (Qwen3-0.6B on A100)
 
 | Initialization | Convergence | Final ASR | Time |
 |---------------|-------------|-----------|------|

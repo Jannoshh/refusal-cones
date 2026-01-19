@@ -33,7 +33,7 @@ def main():
     # Step 1: Configuration
     # ========================================================================
 
-    MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"  # Or your model
+    MODEL_NAME = "Qwen/Qwen3-0.6B"  # Or your model
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Data config

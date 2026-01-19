@@ -79,7 +79,7 @@ class SimpleGP:
         self.R_train = None
 
         # Kernel parameters (can be learned)
-        self.noise_var = 0.01
+        self.noise_var = 0.1  # Higher noise for numerical stability
 
     def fit(self, V: torch.Tensor, R: torch.Tensor):
         """
@@ -114,11 +114,23 @@ class SimpleGP:
         K_test_train = self._kernel(V_test, self.V_train)
         K_test_test = self._kernel(V_test, V_test)
 
-        # Add noise to diagonal
-        K_train_train_noisy = K_train_train + self.noise_var * torch.eye(len(K_train_train))
+        # Add noise to diagonal with increasing jitter for numerical stability
+        jitter = self.noise_var
+        K_train_train_noisy = K_train_train + jitter * torch.eye(len(K_train_train), device=K_train_train.device)
 
-        # Solve for weights
-        L = torch.linalg.cholesky(K_train_train_noisy)
+        # Solve for weights with fallback jitter
+        for attempt in range(5):
+            try:
+                L = torch.linalg.cholesky(K_train_train_noisy)
+                break
+            except torch._C._LinAlgError:
+                jitter *= 10
+                K_train_train_noisy = K_train_train + jitter * torch.eye(len(K_train_train), device=K_train_train.device)
+        else:
+            # Last resort: use pseudoinverse instead of cholesky
+            mean = K_test_train @ torch.linalg.lstsq(K_train_train_noisy, self.R_train.unsqueeze(-1)).solution.squeeze(-1)
+            std = torch.ones(len(V_test), device=V_test.device) * 0.5
+            return mean, std
         alpha = torch.cholesky_solve(self.R_train.unsqueeze(-1), L).squeeze(-1)
 
         # Predictive mean

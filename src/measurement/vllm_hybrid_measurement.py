@@ -14,6 +14,7 @@ Installation:
 import torch
 import torch.nn as nn
 from typing import List, Tuple, Optional
+from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -22,6 +23,18 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
     print("Warning: vLLM not installed. Install with: pip install vllm")
+
+
+@dataclass
+class HybridMeasurementConfig:
+    """Configuration for hybrid vLLM + HuggingFace measurement."""
+
+    model_name: str = "Qwen/Qwen3-0.6B"
+    vllm_gpu_memory: float = 0.45  # Fraction of GPU memory for vLLM
+    use_vllm: bool = True  # If False, fall back to pure HF
+    batch_size: int = 16  # Default batch size for measurements
+    max_tokens: int = 100  # Max tokens to generate
+    temperature: float = 0.0  # Sampling temperature (0 = deterministic)
 
 
 class HybridMeasurement:
@@ -41,7 +54,7 @@ class HybridMeasurement:
 
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-2-7b-chat-hf",
+        model_name: str = "Qwen/Qwen3-0.6B",
         vllm_gpu_memory: float = 0.45,  # Leave room for HF model
         use_vllm: bool = True
     ):
@@ -338,7 +351,7 @@ def example_usage():
 
     # Initialize
     measurer = HybridMeasurement(
-        model_name="meta-llama/Llama-2-7b-chat-hf",
+        model_name="Qwen/Qwen3-0.6B",
         use_vllm=VLLM_AVAILABLE
     )
 

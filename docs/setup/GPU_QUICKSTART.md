@@ -65,7 +65,7 @@ cp /path/to/your/refusal_vector.pt ./v_init.pt
 
 # Verify format
 python -c "import torch; v = torch.load('v_init.pt'); print(f'Shape: {v.shape}')"
-# Expected: Shape: torch.Size([26, 2048]) for Llama-2-7B
+# Expected: Shape: torch.Size([26, 2048]) for Qwen3-0.6B
 ```
 
 **Option B: You don't have a vector yet**
@@ -74,7 +74,7 @@ python -c "import torch; v = torch.load('v_init.pt'); print(f'Shape: {v.shape}')
 # Create a random initialization (we'll improve it with discovery)
 import torch
 
-# For Llama-2-7B: 26 layers, 2048 hidden dim
+# For Qwen3-0.6B: 26 layers, 2048 hidden dim
 # For Llama-2-13B: 40 layers, 5120 hidden dim
 # For Mistral-7B: 32 layers, 4096 hidden dim
 
@@ -155,7 +155,7 @@ import re
 
 # Load model ONCE (reuse across measurements)
 print("Loading model...")
-MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
@@ -543,7 +543,7 @@ with open('training_harmless.json') as f:
     harmless_data = json.load(f)
 
 # Load base model
-model_name = "meta-llama/Llama-2-7b-chat-hf"
+model_name = "Qwen/Qwen3-0.6B"
 base_model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
@@ -612,7 +612,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 # Load model with adapters
-model_name = "meta-llama/Llama-2-7b-chat-hf"
+model_name = "Qwen/Qwen3-0.6B"
 
 model = AutoModelForCausalLM.from_pretrained(
     model_name,

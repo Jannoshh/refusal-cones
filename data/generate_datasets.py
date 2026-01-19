@@ -1,11 +1,6 @@
-# %%
-%load_ext autoreload
-%autoreload 2
-
 import sys
 sys.path.append('..')
 
-# %%
 import os
 import json
 import pandas as pd
@@ -13,10 +8,6 @@ import random
 
 from datasets import load_dataset
 
-# %% [markdown]
-# ## Load datasets
-
-# %%
 import requests
 
 def download_file(url, file_path):
@@ -38,7 +29,6 @@ def dump_json(data, file_path):
     with open(file_path, "w") as file:
         json.dump(data, file, indent=4)
 
-# %%
 current_dir = os.path.abspath("")
 raw_data_dir = os.path.join(current_dir, 'raw')
 processed_data_dir = os.path.join(current_dir, 'processed')
@@ -176,6 +166,10 @@ def download_circuit_breakers():
         with open(raw_path, 'r') as f:
             data = json.load(f)
 
+        # Handle dict with 'data' key (harmbench format)
+        if isinstance(data, dict) and 'data' in data:
+            data = data['data']
+
         if not isinstance(data, list) or len(data) == 0:
             raise ValueError(f"Expected non-empty list in {remote_name}, got {type(data)}")
 
@@ -202,22 +196,17 @@ def download_circuit_breakers():
         dump_json(processed, processed_path)
         print(f"Downloaded {remote_name}: {len(processed)} examples")
 
-# %%
-download_advbench()
-download_malicious_instruct()
-download_tdc2023()
-download_jailbreakbench()
-download_harmbench(split='val')
-download_harmbench(split='test')
-download_strongreject()
+# download_advbench()
+# download_malicious_instruct()
+# download_tdc2023()
+# download_jailbreakbench()
+# download_harmbench(split='val')
+# download_harmbench(split='test')
+# download_strongreject()
 download_circuit_breakers()
 
 download_alpaca()
 
-# %% [markdown]
-# ## Construct train, val, test datasets
-
-# %%
 current_dir = os.path.abspath("")
 splits_data_dir = os.path.join(current_dir, 'splits')
 
@@ -272,10 +261,8 @@ def construct_harmless_dataset_splits():
     dump_json(harmless_val_instructions, harmless_val_path)
     dump_json(harmless_test_instructions, harmless_test_path)
 
-# %%
 construct_harmful_dataset_splits()
 construct_harmless_dataset_splits()
 
-# %%
 
 

@@ -24,17 +24,30 @@ from .unified_rdo_trainer import (
     prepare_unified_dataset,
     train_unified_rdo
 )
-from .unified_rdo_eval import (
-    UnifiedRDOEvaluator,
-    EvaluationResults,
-    evaluate_unified_rdo
-)
-from .refusal_token_eval import (
-    RefusalTokenEvaluator,
-    RefusalTokenResults,
-    evaluate_with_refusal_tokens,
-    get_refusal_tokens
-)
+# These modules have external dependencies that may not be available
+try:
+    from .unified_rdo_eval import (
+        UnifiedRDOEvaluator,
+        EvaluationResults,
+        evaluate_unified_rdo
+    )
+except ImportError:
+    UnifiedRDOEvaluator = None
+    EvaluationResults = None
+    evaluate_unified_rdo = None
+
+try:
+    from .refusal_token_eval import (
+        RefusalTokenEvaluator,
+        RefusalTokenResults,
+        evaluate_with_refusal_tokens,
+        get_refusal_tokens
+    )
+except ImportError:
+    RefusalTokenEvaluator = None
+    RefusalTokenResults = None
+    evaluate_with_refusal_tokens = None
+    get_refusal_tokens = None
 
 __all__ = [
     # Standard RDO

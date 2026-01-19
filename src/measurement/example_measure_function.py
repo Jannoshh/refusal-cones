@@ -231,7 +231,7 @@ def example_usage():
     print("=" * 70)
 
     # Setup
-    model_name = "meta-llama/Llama-2-7b-chat-hf"
+    model_name = "Qwen/Qwen3-0.6B"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
@@ -254,7 +254,7 @@ def example_usage():
         return torch.rand(len(prompts))
 
     # Initial vector (random for demo)
-    n_layers = 26  # Llama-2-7B
+    n_layers = 28  # Qwen3-0.6B
     hidden_dim = 2048
     v = torch.randn(n_layers, hidden_dim)
     v = v / v.norm(dim=1, keepdim=True)
@@ -307,8 +307,8 @@ def example_usage_in_discovery():
     v_init = torch.load("existing_vector.pt")  # Your prior!
 
     # Setup model and prompts
-    model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     harmful_prompts = load_harmful_prompts()  # Your dataset
     classifier = load_harmbench_classifier()   # HarmBench
 

@@ -28,7 +28,7 @@ vLLM is designed for **inference only**, not training:
 # vLLM engine
 from vllm import LLM
 
-llm = LLM(model="meta-llama/Llama-2-7b-chat-hf")
+llm = LLM(model="Qwen/Qwen3-0.6B")
 
 # Generate (FAST!)
 outputs = llm.generate(prompts)
@@ -572,7 +572,7 @@ def measure_refusal_hybrid(
 # Usage
 if __name__ == '__main__':
     # Setup
-    model_name = "meta-llama/Llama-2-7b-chat-hf"
+    model_name = "Qwen/Qwen3-0.6B"
 
     # vLLM for generation
     vllm_engine = LLM(

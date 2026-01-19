@@ -218,7 +218,7 @@ for k in [1, 2, 3, 5, 10]:
 **Transfer learning across model sizes:**
 
 ```python
-# Phase 1: Discover on Llama-2-7B
+# Phase 1: Discover on Qwen3-0.6B
 discovery_7b = GradientGeometryDiscovery(...)
 results_7b = discovery_7b.discover()
 
@@ -381,7 +381,7 @@ R_pred = field(v_new)
 | **Gradient + GP + Prior** | **78%** | **77%** | **0.5h + 6h** |
 
 **Transferability:**
-- Train on Llama-2-7B, test on Llama-2-13B
+- Train on Qwen3-0.6B, test on Llama-2-13B
 - Train on Llama-2, test on Mistral
 - Measure: ASR drop when transferring
 

@@ -94,7 +94,7 @@ train_data, val_data = prepare_rdo_datasets(
 from src.utils import format_prompt_for_model
 
 # Format for your model
-model_name = "meta-llama/Llama-2-7b-chat-hf"
+model_name = "Qwen/Qwen3-0.6B"
 
 formatted_prompts = [
     format_prompt_for_model(item['prompt'], model_name)

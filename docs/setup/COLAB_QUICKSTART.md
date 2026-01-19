@@ -5,7 +5,7 @@
 ## Why Qwen3-0.6B?
 
 - ✅ **Small:** 0.6B parameters (fits in 15GB VRAM)
-- ✅ **Fast:** Discovery in ~10 minutes (vs 30 min for Llama-2-7B)
+- ✅ **Fast:** Discovery in ~10 minutes (vs 30 min for Qwen3-0.6B)
 - ✅ **Free:** Runs on Colab free tier
 - ⚠️ **Different refusal:** May have weaker/different refusal mechanisms than larger models
 
@@ -456,7 +456,7 @@ print(f"✓ Max R: {results['R_observed'].max():.4f}")
 
 ## Key Differences for Colab/Qwen
 
-| Parameter | Llama-2-7B (A100) | Qwen3-0.6B (Colab T4) |
+| Parameter | Qwen3-0.6B (A100) | Qwen3-0.6B (Colab T4) |
 |-----------|-------------------|----------------------|
 | **Layers** | 26 | 24 |
 | **Hidden dim** | 2048 | 896 |
