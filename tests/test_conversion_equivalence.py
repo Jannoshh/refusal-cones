@@ -152,12 +152,7 @@ def test_output_equivalence():
     print(f"Output (weights): {out_weights[0, :5]}")
     print(f"\nMax difference: {diff:.2e}")
 
-    if diff < 1e-5:
-        print("✓ PASS: Outputs are equivalent")
-    else:
-        print("✗ FAIL: Outputs differ significantly")
-
-    return diff < 1e-5
+    assert diff < 1e-5
 
 
 def test_gradient_flow():
@@ -217,12 +212,8 @@ def test_gradient_flow():
     # Both should have gradients
     has_grads = (v1.grad is not None) and (v2.grad is not None)
 
-    if has_grads and grad_diff < 1e-4:
-        print("✓ PASS: Gradients flow correctly in both methods")
-        return True
-    else:
-        print("✗ FAIL: Gradient flow differs")
-        return False
+    assert has_grads
+    assert grad_diff < 1e-4
 
 
 def test_training_equivalence():
@@ -298,12 +289,8 @@ def test_training_equivalence():
     loss_diff = max(abs(l1 - l2) for l1, l2 in zip(losses1, losses2))
     print(f"Max loss difference: {loss_diff:.2e}")
 
-    if vector_diff < 1e-4 and loss_diff < 1e-4:
-        print("✓ PASS: Both methods converge to same solution")
-        return True
-    else:
-        print("✗ FAIL: Training trajectories differ")
-        return False
+    assert vector_diff < 1e-4
+    assert loss_diff < 1e-4
 
 
 def test_with_real_model():
@@ -366,19 +353,14 @@ def test_with_real_model():
         diff = (out1 - out2).abs().max().item()
         print(f"\nMax output difference: {diff:.2e}")
 
-        if diff < 1e-4:
-            print("✓ PASS: Works with real transformer layer")
-            return True
-        else:
-            print("✗ FAIL: Outputs differ on real model")
-            return False
+        assert diff < 1e-4
 
     except ImportError:
         print("⚠ SKIP: transformers not available")
-        return True
+        return
     except Exception as e:
         print(f"⚠ ERROR: {e}")
-        return False
+        raise
 
 
 def test_backward_compatibility():
@@ -402,32 +384,17 @@ def test_backward_compatibility():
     vectors = PerLayerRefusalVectors(n_layers, hidden_dim)
 
     # Test conversion
-    try:
-        # Convert model (would wrap layers with VectorModifiedLayer)
-        # For our simple model, we'll just test the concept
-        print("\nTesting conversion utilities...")
+    # Convert model (would wrap layers with VectorModifiedLayer)
+    print("\nTesting conversion utilities...")
 
-        v = vectors.get_all_vectors()[0]
+    v = vectors.get_all_vectors()[0]
 
-        # Can extract parameters
-        print(f"✓ Vector extraction works")
+    from src.utils.conversion_utils import VectorModifiedLayer
+    wrapped = VectorModifiedLayer(model, ablation_vector=v)
 
-        # Can create modified layer
-        from src.utils.conversion_utils import VectorModifiedLayer
-        wrapped = VectorModifiedLayer(model, ablation_vector=v)
-        print(f"✓ Layer wrapping works")
-
-        # Can get trainable params
-        from utils.conversion_utils import get_trainable_vector_parameters
-        params = [p for p in wrapped.parameters() if p.requires_grad]
-        print(f"✓ Parameter extraction works ({len(params)} trainable params)")
-
-        print("\n✓ PASS: Conversion utilities work correctly")
-        return True
-
-    except Exception as e:
-        print(f"\n✗ FAIL: {e}")
-        return False
+    from utils.conversion_utils import get_trainable_vector_parameters
+    params = [p for p in wrapped.parameters() if p.requires_grad]
+    assert len(params) > 0
 
 
 # =============================================================================
