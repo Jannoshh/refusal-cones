@@ -20,6 +20,11 @@ This codebase enables you to:
 3. **Optimize with RDO** - Multi-objective training (ablation + addition + retain)
 4. **Scale Efficiently** - Use PEFT adapters instead of custom implementations (97% less code)
 
+### Latest updates
+- Gradient/adaptive discovery now support configurable kernels and optional sparse GP (adaptive inducing points). Enable via `use_sparse_gp=True`, tune `kernel_type`, `kernel_lengthscale`, `num_inducing`, etc.
+- New fast CPU tests cover discovery, sparse GP, and loss alignment; run with `pytest -q` (use `. .venv/bin/activate` first). No GPU required.
+- E1 efficiency script exposes flags for the above (`--use_sparse_gp`, `--kernel`, `--lengthscale`, `--num_inducing`, `--sparse_steps`, `--sparse_lr`).
+
 ### Key Innovation: Gradient-Based Adaptive Discovery
 
 Instead of assuming refusal is a simple cone (linear subspace), we:
