@@ -66,7 +66,7 @@ def main():
 
     # Load actual harmful prompts from your dataset
     try:
-        harmful_data = json.load(open('data/saladbench_splits/harmful_test.json'))
+        harmful_data = json.load(open('data/splits/harmful_test.json'))
         harmful_prompts = [d['instruction'] for d in harmful_data[:50]]
         print(f"  Loaded {len(harmful_prompts)} harmful test prompts")
     except:
