@@ -53,7 +53,7 @@ cd refusal-cones
 If you have an existing refusal vector:
 
 ```python
-from gradient_discovery import GradientGeometryDiscovery, GradientDiscoveryConfig
+from src.discovery import GradientGeometryDiscovery, GradientDiscoveryConfig
 import torch
 
 # Load your existing refusal vector (prior!)
@@ -138,8 +138,7 @@ Speedup: 7.5× fewer measurements than pure GP!
 Use discovered geometry to initialize training:
 
 ```python
-from rdo_peft_adapter import get_cone_model, get_rdo_model, RDOConfig
-from rdo_peft_trainer import train_rdo_with_peft
+from src.training import get_cone_model, get_rdo_model, RDOConfig, train_rdo_with_peft
 from transformers import AutoModelForCausalLM
 
 # Load base model
@@ -239,40 +238,45 @@ print(f"Compliance rate: {compliance_rate:.1%}")
 
 ## Repository Structure
 
-### Core Discovery
+See **[STRUCTURE.md](STRUCTURE.md)** for detailed directory layout and navigation guide.
 
-| File | Purpose | Use When |
-|------|---------|----------|
-| `gradient_discovery.py` | Gradient-based discovery (RECOMMENDED) | You have existing vector + want efficiency |
-| `efficient_discovery.py` | Pure GP with efficiency strategies | No prior, want thorough exploration |
-| `adaptive_geometry_discovery.py` | Base GP implementation | Building custom discovery |
+### Quick Overview
 
-### Training
+```
+refusal-cones/
+├── src/                   # Core implementations
+│   ├── discovery/        # Geometry discovery (gradient_discovery.py, etc.)
+│   ├── training/         # Training modules (rdo_peft_adapter.py, etc.)
+│   ├── measurement/      # Evaluation (vllm_hybrid_measurement.py, etc.)
+│   └── utils/            # Utilities
+├── docs/                  # All documentation
+│   ├── setup/            # Getting started guides
+│   ├── discovery/        # Discovery methods
+│   ├── training/         # Training guides
+│   └── integrations/     # Third-party integrations
+├── examples/              # Example scripts
+├── tests/                 # Test suite
+├── scripts/               # Utility scripts
+└── legacy/                # Historical code (reference only)
+```
 
-| File | Purpose |
-|------|---------|
-| `rdo_peft_adapter.py` | PEFT adapters for projection (ablation/addition) |
-| `rdo_peft_trainer.py` | Multi-objective RDO training |
-| `projection_adapter.py` | Simple projection (ablation only) |
+### Core Modules
 
-### Documentation
+**Discovery** (in `src/discovery/`):
+- `gradient_discovery.py` - Gradient-based discovery (RECOMMENDED)
+- `efficient_discovery.py` - Pure GP with efficiency strategies
+- `adaptive_geometry_discovery.py` - Base GP implementation
 
-| File | Description |
-|------|-------------|
-| `GRADIENT_BASED_DISCOVERY.md` | **START HERE** - Why gradients + prior = 10× speedup |
-| `EXPLORATION_METHODS_COMPARISON.md` | Compare all 3 approaches (fixed cones, GP, gradient+GP) |
-| `EFFICIENT_HYPERSPHERE_EXPLORATION.md` | How to explore 53,248-dimensional space efficiently |
-| `SAMPLING_SPACE_EXPLAINED.md` | Cones vs adaptive: what space are we sampling? |
-| `GEOMETRY_COMPARISON.md` | Detailed cone vs adaptive comparison |
-| `ADAPTIVE_GEOMETRY_DISCOVERY.md` | Full theoretical foundation (~50 pages) |
-| `SUMMARY.md` | Complete overview of entire approach |
+**Training** (in `src/training/`):
+- `rdo_peft_adapter.py` - PEFT adapters for projection
+- `rdo_peft_trainer.py` - Multi-objective RDO training
+- `projection_adapter.py` - Simple projection adapter
 
-### Legacy/Reference
-
-| File | Note |
-|------|------|
-| `refusal_vector_training.py` | Original nnsight-based (DEPRECATED - use PEFT) |
-| `train_vectors_pytorch.py` | PyTorch hooks version (DEPRECATED - use PEFT) |
+**Documentation** (in `docs/`):
+- `docs/discovery/GRADIENT_BASED_DISCOVERY.md` - **START HERE**
+- `docs/discovery/EXPLORATION_METHODS_COMPARISON.md` - Compare all approaches
+- `docs/setup/GPU_QUICKSTART.md` - Step-by-step setup guide
+- `docs/setup/COLAB_QUICKSTART.md` - Colab-specific guide
 
 ## Key Concepts
 
@@ -335,31 +339,25 @@ v = v / ||v||                       # Retract to sphere
 ### Workflow 1: Discover + Train (Recommended)
 
 ```bash
-# 1. Discover geometry with gradients + prior
-python gradient_discovery.py \
-    --v_init existing_vector.pt \
-    --n_gradient_steps 20 \
-    --n_local_iterations 30 \
-    --output discovery_results.pkl
+# 1. See full example
+python examples/example_full_pipeline.py
 
-# 2. Train with discovered geometry
-python train_with_discovery.py \
-    --discovery discovery_results.pkl \
-    --harmful_data harmful.json \
-    --harmless_data harmless.json \
-    --output_dir adapters/
+# Or step-by-step:
+# Discover geometry
+python -m src.discovery.gradient_discovery
 
-# 3. Evaluate
-python evaluate.py \
-    --adapters adapters/ \
-    --test_data test_harmful.json
+# Train with discovered geometry
+python examples/example_per_layer_training.py
+
+# Evaluate
+python examples/example_adversarial_training.py
 ```
 
 ### Workflow 2: Visualize Geometry (3D Demo)
 
 ```bash
 # Generate visualizations
-python visualize_geometry.py
+python scripts/visualize_geometry.py
 
 # Creates:
 #   - cone_vs_adaptive_3d.png (sampling space comparison)
@@ -371,7 +369,7 @@ python visualize_geometry.py
 
 ```bash
 # Compare gradient vs pure GP
-python gradient_discovery.py  # Runs demo comparing both
+python -m src.discovery.gradient_discovery  # Runs demo comparing both
 
 # Expected output:
 # Method                      Measurements    Max R Found
@@ -383,7 +381,7 @@ python gradient_discovery.py  # Runs demo comparing both
 
 ## Next Steps
 
-See **[NEXT_STEPS.md](NEXT_STEPS.md)** for detailed roadmap with timelines and milestones.
+See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadmap.
 
 **Quick summary:**
 - **Immediate (Week 1):** Implement `measure_refusal_with_grad`, run discovery, train → First working jailbreak
@@ -391,7 +389,7 @@ See **[NEXT_STEPS.md](NEXT_STEPS.md)** for detailed roadmap with timelines and m
 - **Medium-term (Quarter 1):** Category-specific, RL stage, neural fields → Advanced features
 - **Long-term (Ongoing):** Theory, benchmarking, interpretability → Research contributions
 
-**Start here:** See `example_measure_function.py` for implementing the measurement function with proper batch sizing and gradient computation.
+**Start here:** See `src/measurement/example_measure_function.py` for implementing the measurement function with proper batch sizing and gradient computation.
 
 ## Troubleshooting
 
