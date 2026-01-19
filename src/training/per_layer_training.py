@@ -33,6 +33,26 @@ def projection_einops(activation, direction):
     return proj
 
 
+def create_ablation_hook(vector):
+    """
+    Create a hook that ablates activations by projecting out a direction.
+
+    Args:
+        vector: Direction vector to ablate (will be used directly, not copied)
+
+    Returns:
+        Hook function for register_forward_hook
+    """
+    def hook(module, input, output):
+        if isinstance(output, tuple):
+            act = output[0]
+            ablated = act - projection_einops(act, vector)
+            return (ablated,) + output[1:]
+        else:
+            return output - projection_einops(output, vector)
+    return hook
+
+
 def smooth_max_loss(losses: Tensor, temperature: float = 1.0) -> Tensor:
     """
     Smooth maximum loss (log-sum-exp approximation to max).
@@ -184,33 +204,11 @@ def apply_per_layer_ablation(
     # Get normalized vectors for each layer
     vectors = layer_vectors.get_all_vectors()
 
-    # Create hooks for each layer
-    handles = []
-
-    def create_hook(layer_idx: int):
-        vector = vectors[layer_idx].to(model.dtype)
-
-        def hook(module, input, output):
-            # Handle tuple outputs
-            if isinstance(output, tuple):
-                act = output[0]
-            else:
-                act = output
-
-            # Apply ablation
-            ablated = act - projection_einops(act, vector)
-
-            # Return with same structure
-            if isinstance(output, tuple):
-                return (ablated,) + output[1:]
-            else:
-                return ablated
-
-        return hook
-
     # Register hooks on all layers
+    handles = []
     for idx, layer in enumerate(model.model.layers):
-        handle = layer.register_forward_hook(create_hook(idx))
+        vector = vectors[idx].to(model.dtype)
+        handle = layer.register_forward_hook(create_ablation_hook(vector))
         handles.append(handle)
 
     # Forward pass
@@ -324,77 +322,38 @@ def train_per_layer_vectors(
             # Get normalized vectors
             vectors = layer_vectors.get_all_vectors()
 
-            # Compute per-layer losses
+            # Compute per-layer losses (each layer ablated independently)
             per_layer_losses = []
-
             for layer_idx in range(n_layers):
-                # Create hook for this layer only
                 vector = vectors[layer_idx].to(model.dtype)
+                handle = model.model.layers[layer_idx].register_forward_hook(create_ablation_hook(vector))
 
-                def create_hook(vec):
-                    def hook(module, input, output):
-                        if isinstance(output, tuple):
-                            act = output[0]
-                        else:
-                            act = output
-                        ablated = act - projection_einops(act, vec)
-                        if isinstance(output, tuple):
-                            return (ablated,) + output[1:]
-                        else:
-                            return ablated
-                    return hook
-
-                # Apply ablation only at this layer
-                handle = model.model.layers[layer_idx].register_forward_hook(create_hook(vector))
-
-                # Forward pass
                 outputs = model(**inputs)
-
-                # Compute loss
                 logits = outputs.logits[:, :-1]
                 loss = compute_ce_loss(logits, ablation_labels)
                 per_layer_losses.append(loss)
 
-                # Clean up hook
                 handle.remove()
 
-            # Stack per-layer losses
             per_layer_losses = torch.stack(per_layer_losses)
 
-            # Compute final loss
+            # Aggregate per-layer losses
             if use_smooth_max:
                 total_loss = smooth_max_loss(per_layer_losses, smooth_max_temperature)
             else:
                 total_loss = per_layer_losses.mean()
 
-            # Also compute combined loss (all layers together)
-            # This encourages vectors to work together
+            # Compute combined loss (all layers ablated together)
             all_handles = []
             for layer_idx in range(n_layers):
                 vector = vectors[layer_idx].to(model.dtype)
-
-                def create_hook(vec):
-                    def hook(module, input, output):
-                        if isinstance(output, tuple):
-                            act = output[0]
-                        else:
-                            act = output
-                        ablated = act - projection_einops(act, vec)
-                        if isinstance(output, tuple):
-                            return (ablated,) + output[1:]
-                        else:
-                            return ablated
-                    return hook
-
-                handle = model.model.layers[layer_idx].register_forward_hook(create_hook(vector))
+                handle = model.model.layers[layer_idx].register_forward_hook(create_ablation_hook(vector))
                 all_handles.append(handle)
 
-            # Forward pass with all ablations
             outputs = model(**inputs)
             logits = outputs.logits[:, :-1]
             combined_loss = compute_ce_loss(logits, ablation_labels)
 
-            # Clean up hooks
             for handle in all_handles:
                 handle.remove()
 
@@ -488,29 +447,12 @@ def evaluate_per_layer_vectors(
 
         for i in range(0, len(eval_prompts), batch_size):
             batch_prompts = eval_prompts[i:i+batch_size]
-
-            # Tokenize
             inputs = tokenizer(batch_prompts, add_special_tokens=True, padding=True,
                              truncation=False, return_tensors='pt')
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            # Apply ablation at this layer only
             vector = vectors[layer_idx].to(model.dtype)
-
-            def create_hook(vec):
-                def hook(module, input, output):
-                    if isinstance(output, tuple):
-                        act = output[0]
-                    else:
-                        act = output
-                    ablated = act - projection_einops(act, vec)
-                    if isinstance(output, tuple):
-                        return (ablated,) + output[1:]
-                    else:
-                        return ablated
-                return hook
-
-            handle = model.model.layers[layer_idx].register_forward_hook(create_hook(vector))
+            handle = model.model.layers[layer_idx].register_forward_hook(create_ablation_hook(vector))
 
             with torch.no_grad():
                 outputs = model(**inputs)
@@ -527,30 +469,14 @@ def evaluate_per_layer_vectors(
     combined_scores = []
     for i in range(0, len(eval_prompts), batch_size):
         batch_prompts = eval_prompts[i:i+batch_size]
-
         inputs = tokenizer(batch_prompts, add_special_tokens=True, padding=True,
                          truncation=False, return_tensors='pt')
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        # Apply all ablations
         handles = []
         for layer_idx in range(layer_vectors.n_layers):
             vector = vectors[layer_idx].to(model.dtype)
-
-            def create_hook(vec):
-                def hook(module, input, output):
-                    if isinstance(output, tuple):
-                        act = output[0]
-                    else:
-                        act = output
-                    ablated = act - projection_einops(act, vec)
-                    if isinstance(output, tuple):
-                        return (ablated,) + output[1:]
-                    else:
-                        return ablated
-                return hook
-
-            handle = model.model.layers[layer_idx].register_forward_hook(create_hook(vector))
+            handle = model.model.layers[layer_idx].register_forward_hook(create_ablation_hook(vector))
             handles.append(handle)
 
         with torch.no_grad():

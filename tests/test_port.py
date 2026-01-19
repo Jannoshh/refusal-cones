@@ -16,8 +16,8 @@ def test_imports():
     print("Testing imports...")
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from measurement import scoring
-        from utils import generate_utils
+        from src.measurement import scoring
+        from src.utils import generate_utils
         print("✓ All imports successful")
         return True
     except Exception as e:
@@ -28,7 +28,7 @@ def test_scoring_functions():
     """Test that scoring functions are correctly defined."""
     print("\nTesting scoring functions...")
     try:
-        from measurement.scoring import get_logits, get_refusal_scores, get_induce_scores, refusal_score_fn
+        from src.measurement.scoring import get_logits, get_refusal_scores, get_induce_scores, refusal_score_fn
         print("✓ All scoring functions imported")
 
         # Check function signatures
@@ -46,7 +46,7 @@ def test_generate_utils():
     """Test that generation utilities are correctly defined."""
     print("\nTesting generation utilities...")
     try:
-        from utils.generate_utils import (
+        from src.utils.generate_utils import (
             generate_completions,
             intervene_with_fn_vector_ablation,
             intervene_with_fn_vector_addition,
@@ -69,8 +69,8 @@ def test_model_utils():
     """Test that model utilities module exists and is importable."""
     print("\nTesting model utilities...")
     try:
-        from utils import model_utils
-        from utils.model_utils import HookedModel
+        from src.utils import model_utils
+        from src.utils.model_utils import HookedModel
         print("✓ model_utils module imported successfully")
         return True
     except Exception as e:
