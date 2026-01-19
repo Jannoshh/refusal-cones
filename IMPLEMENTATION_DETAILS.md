@@ -59,9 +59,9 @@ R = mean([0.2, 0.8, 0.1, 0.9, 0.3, 0.7, ...]) = 0.51
 
 | Phase | Batch Size | Reasoning |
 |-------|-----------|-----------|
-| **Discovery** | 8-16 | Balance speed vs stability |
-| **Gradient ascent** | 4-8 | Fast iterations, can tolerate noise |
-| **RDO training** | 4-8 | Per GPU, accumulate if needed |
+| **Discovery** | 16 | Balance speed vs stability |
+| **Gradient ascent** | 8 | Fast iterations, can tolerate noise |
+| **RDO training** | 8 | Memory efficient |
 | **Final evaluation** | 32+ | Accurate measurement |
 
 ### Implementation
@@ -70,8 +70,7 @@ R = mean([0.2, 0.8, 0.1, 0.9, 0.3, 0.7, ...]) = 0.51
 def measure_refusal_with_grad(
     v: torch.Tensor,
     prompts: List[str],
-    batch_size: int = 8,  # ← Key parameter
-    num_batches: int = 2   # ← Average over multiple batches
+    batch_size: int = 16  # ← Key parameter
 ) -> Tuple[float, torch.Tensor]:
     """
     Compute R(v) and ∇R(v) with controlled batch size.
@@ -80,46 +79,31 @@ def measure_refusal_with_grad(
         v: Direction [n_layers, hidden_dim]
         prompts: Pool of harmful prompts
         batch_size: Prompts per forward pass
-        num_batches: Number of batches to average over
 
     Returns:
         R: Mean refusal rate
-        grad: Mean gradient ∂R/∂v
+        grad: Gradient ∂R/∂v
     """
     v.requires_grad = True
 
-    R_samples = []
-    grad_accumulator = torch.zeros_like(v)
+    # Sample batch of prompts
+    batch_prompts = random.sample(prompts, batch_size)
 
-    for _ in range(num_batches):
-        # Sample batch of prompts
-        batch_prompts = random.sample(prompts, batch_size)
+    # Apply ablation
+    model_ablated = apply_projection(model, v)
 
-        # Apply ablation
-        model_ablated = apply_projection(model, v)
+    # Generate
+    responses = model_ablated.generate(batch_prompts)
 
-        # Generate
-        responses = model_ablated.generate(batch_prompts)
+    # Score
+    scores = harmbench_classifier(batch_prompts, responses)
+    R = (scores < 0.5).float().mean()
 
-        # Score
-        scores = harmbench_classifier(batch_prompts, responses)
-        R_batch = (scores < 0.5).float().mean()
+    # Backprop
+    R.backward()
+    grad = v.grad.clone()
 
-        # Backprop
-        R_batch.backward()
-
-        # Accumulate
-        R_samples.append(R_batch.item())
-        grad_accumulator += v.grad / num_batches
-
-        # Zero gradient for next batch
-        v.grad.zero_()
-
-    # Final estimates
-    R = np.mean(R_samples)
-    grad = grad_accumulator
-
-    return R, grad
+    return R.item(), grad
 ```
 
 ### Gradient Variance Analysis
@@ -156,8 +140,7 @@ n_steps = 10  # Fewer steps needed
 ```python
 config = GradientDiscoveryConfig(
     gradient_lr=0.1,
-    batch_size=8,          # Moderate batch
-    num_batches=2,         # Average over 2 batches = 16 total prompts
+    batch_size=16,         # Moderate batch for stability
     n_gradient_steps=20    # Enough for convergence
 )
 ```
@@ -165,9 +148,7 @@ config = GradientDiscoveryConfig(
 **For RDO training:**
 ```python
 training_args = TrainingArguments(
-    per_device_train_batch_size=4,  # Small per GPU
-    gradient_accumulation_steps=4,   # Accumulate to effective batch=16
-    # Effective: 4 × 4 = 16 prompts per update
+    per_device_train_batch_size=8,  # Memory efficient batch size
 )
 ```
 
@@ -421,11 +402,10 @@ Compute: O(n × m²)
 ### Summary
 
 **Batch Size for Gradients:**
-- Use `batch_size=8-16` for discovery
-- Average over `num_batches=2` for stability
+- Use `batch_size=16` for discovery (balanced)
+- Use `batch_size=8` for training (memory efficient)
+- Use `batch_size=32+` for final evaluation (accurate)
 - Trade-off: variance vs speed
-- Smaller batches OK for gradient ascent (can tolerate noise)
-- Larger batches better for final evaluation
 
 **GP Structure:**
 - Use **joint GP** (current implementation is correct!)
