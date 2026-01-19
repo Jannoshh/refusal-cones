@@ -376,13 +376,13 @@ class MultiObjectiveScorer:
 
     def _prepare_completion_inputs(self):
         """Prepare inputs for multi-token completion scoring."""
-        # Tokenize prompts alone to get prompt lengths
+        # Tokenize prompts alone to get prompt lengths (without tensor conversion)
         prompt_encodings = self.tokenizer(
             self.harmful_prompts,
-            return_tensors='pt',
             padding=False,
             truncation=True,
-            max_length=256
+            max_length=256,
+            add_special_tokens=False  # Keep prompt lengths aligned with full-text inputs
         )
         self.prompt_lengths = [len(ids) for ids in prompt_encodings['input_ids']]
 
@@ -395,7 +395,8 @@ class MultiObjectiveScorer:
             return_tensors='pt',
             padding=True,
             truncation=True,
-            max_length=512
+            max_length=512,
+            add_special_tokens=False
         ).to(self.device)
 
         # Create labels for completion tokens only (mask out prompt tokens)
@@ -422,13 +423,13 @@ class MultiObjectiveScorer:
 
     def _prepare_harmless_completion_inputs(self):
         """Prepare inputs for multi-token KL scoring on harmless completions."""
-        # Tokenize prompts alone to get prompt lengths
+        # Tokenize prompts alone to get prompt lengths (without tensor conversion)
         prompt_encodings = self.tokenizer(
             self.harmless_prompts,
-            return_tensors='pt',
             padding=False,
             truncation=True,
-            max_length=256
+            max_length=256,
+            add_special_tokens=False
         )
         self.harmless_prompt_lengths = [len(ids) for ids in prompt_encodings['input_ids']]
 
@@ -441,7 +442,8 @@ class MultiObjectiveScorer:
             return_tensors='pt',
             padding=True,
             truncation=True,
-            max_length=512
+            max_length=512,
+            add_special_tokens=False
         ).to(self.device)
 
         # Track which positions are completion tokens (for KL computation)
@@ -1080,31 +1082,49 @@ class ParetoGeometryDiscovery:
         # Generate candidates from each starting point with each weight
         n_per_start = max(1, self.config.n_gradient_candidates // len(starting_points))
 
+        oom_occurred = False
         for v_start in starting_points[:self.config.n_gradient_candidates]:
+            if oom_occurred:
+                # After OOM, just use perturbations instead of gradients
+                v = v_start + 0.2 * torch.randn_like(v_start)
+                v = self._normalize_vector(v)
+                candidates.append(v.detach().cpu())
+                continue
+
             for w_refusal, w_kl in weights[:n_per_start]:
                 v = v_start.clone()
 
                 # Run gradient descent
                 for step in range(self.config.gradient_steps):
-                    # Get gradient of scalarized objective
-                    # Both objectives are minimized, so we minimize w_r*refusal + w_k*kl
-                    scores, grad = self.scorer.score(v, return_grad=True)
+                    try:
+                        # Clear cache before gradient computation
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-                    # The gradient from scorer is for (refusal + kl)
-                    # We want to weight them differently for diversity
-                    # Since we can't easily separate the gradients, we use the combined
-                    # gradient but could add noise based on the weight for diversity
-                    if w_refusal < 0.3:
-                        # Focus more on KL: add noise to push away from refusal optima
-                        grad = grad + 0.1 * torch.randn_like(grad)
-                    elif w_refusal > 0.7:
-                        # Focus more on refusal: slight noise
-                        grad = grad + 0.05 * torch.randn_like(grad)
+                        # Get gradient of scalarized objective
+                        scores, grad = self.scorer.score(v, return_grad=True)
 
-                    # Riemannian gradient step
-                    v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+                        # Add noise for diversity based on weight
+                        if w_refusal < 0.3:
+                            grad = grad + 0.1 * torch.randn_like(grad)
+                        elif w_refusal > 0.7:
+                            grad = grad + 0.05 * torch.randn_like(grad)
 
-                candidates.append(v)
+                        # Riemannian gradient step
+                        v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+
+                        # Clear cache after
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            oom_occurred = True
+                            break
+                        raise
+
+                candidates.append(v.detach().cpu())
 
                 # Early exit if we have enough candidates
                 if len(candidates) >= self.config.n_gradient_candidates:
@@ -1136,7 +1156,7 @@ class ParetoGeometryDiscovery:
 
             # First, score the initial point
             scores = self.scorer.score(v)
-            self.V_observed.append(v)
+            self.V_observed.append(v.detach().cpu())  # Store on CPU for consistency
             for obj, val in scores.items():
                 self.scores_observed[obj].append(val)
             samples_collected += 1
@@ -1144,27 +1164,53 @@ class ParetoGeometryDiscovery:
                   f"kl={scores['kl_score']:.4f}")
 
             # Now do gradient descent with varying weights to explore Pareto front
-            n_gradient_init = min(10, self.config.n_init_samples // 3)
+            # Use fewer trajectories (5) to reduce memory pressure
+            n_gradient_init = min(5, self.config.n_init_samples // 5)
             weights = [(i / (n_gradient_init - 1), 1 - i / (n_gradient_init - 1))
                        for i in range(n_gradient_init)] if n_gradient_init > 1 else [(0.5, 0.5)]
 
+            oom_count = 0
             for w_idx, (w_r, w_k) in enumerate(weights):
+                if oom_count >= 2:
+                    # Too many OOM errors, skip remaining gradient trajectories
+                    print("  Skipping remaining gradient trajectories due to OOM...")
+                    break
+
                 v = self.v_init.clone()
                 v = self._normalize_vector(v)
 
-                # More gradient steps for initial exploration
-                for step in range(self.config.gradient_steps * 2):
-                    scores, grad = self.scorer.score(v, return_grad=True)
-                    v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+                # Gradient steps for initial exploration
+                for step in range(self.config.gradient_steps):
+                    try:
+                        # Clear cache before gradient computation
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-                # Store final point
-                scores = self.scorer.score(v)
-                self.V_observed.append(v)
+                        scores, grad = self.scorer.score(v, return_grad=True)
+                        v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+
+                        # Clear cache after gradient computation
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            # OOM during gradient computation - clear cache and skip
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            print(f"  Warning: OOM during gradient step {step}, stopping trajectory...")
+                            oom_count += 1
+                            break
+                        raise
+
+                # Store final point (without gradients)
+                with torch.no_grad():
+                    scores = self.scorer.score(v)
+                self.V_observed.append(v.detach().cpu())  # Store on CPU
                 for obj, val in scores.items():
                     self.scores_observed[obj].append(val)
                 samples_collected += 1
 
-                if w_idx % 3 == 0:
+                if w_idx % 2 == 0:
                     print(f"  Gradient init {w_idx+1}: refusal={scores['refusal_score']:.4f}, "
                           f"kl={scores['kl_score']:.4f}")
 
@@ -1182,8 +1228,8 @@ class ParetoGeometryDiscovery:
             # Score
             scores = self.scorer.score(v)
 
-            # Store
-            self.V_observed.append(v)
+            # Store on CPU for consistency
+            self.V_observed.append(v.detach().cpu())
             for obj, val in scores.items():
                 self.scores_observed[obj].append(val)
 
@@ -1215,8 +1261,8 @@ class ParetoGeometryDiscovery:
             # Score
             scores = self.scorer.score(v_next)
 
-            # Store
-            self.V_observed.append(v_next)
+            # Store on CPU for consistency
+            self.V_observed.append(v_next.detach().cpu())
             for obj, val in scores.items():
                 self.scores_observed[obj].append(val)
 
