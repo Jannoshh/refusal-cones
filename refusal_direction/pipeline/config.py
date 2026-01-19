@@ -9,7 +9,7 @@ class Config:
     model_alias: str
     model_path: str
     n_test: int = 128
-    splits: str = "saladbench"
+    splits: str = "cb"
     sample: bool = False
     filter_train: bool = True
     filter_val: bool = True
