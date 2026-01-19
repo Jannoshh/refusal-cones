@@ -211,61 +211,240 @@ def refusal_score_fn(
 
 
 def get_logits(model, prompts, fn_vector=None, batch_size=8):
+    """
+    Get logits for the last token position with optional directional ablation.
+
+    Args:
+        model: HuggingFace model (or HookedModel)
+        prompts: List of prompt strings
+        fn_vector: Optional direction vector for ablation
+        batch_size: Batch size for processing
+
+    Returns:
+        Tensor of logits for last token position
+    """
     all_logits = []
+
+    # Get the actual model and tokenizer
+    if hasattr(model, 'model'):
+        # HookedModel wrapper
+        base_model = model.model
+        tokenizer = model.tokenizer
+        device = model.device
+        dtype = model.dtype
+    else:
+        # Direct HuggingFace model
+        base_model = model
+        tokenizer = model.tokenizer
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+
     if fn_vector is not None:
         fn_vector = fn_vector / fn_vector.norm()
-        fn_vector = fn_vector.to(model.dtype).to(model.device)
-    
+        fn_vector = fn_vector.to(dtype).to(device)
+
     # Process prompts in batches
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i + batch_size]
-        with model.trace(batch_prompts):
-            if fn_vector is not None:
-                for layer in model.model.layers:
-                    layer.input -= projection_einops(layer.input, fn_vector)
-                    layer.self_attn.output[0][:] -= projection_einops(layer.self_attn.output[0][:], fn_vector)
-                    layer.mlp.output[:] -= projection_einops(layer.mlp.output[:], fn_vector)
-            logits = model.lm_head.output[:, -1].save()
-        all_logits.append(logits.value.detach().cpu())
+
+        # Tokenize
+        inputs = tokenizer(batch_prompts, add_special_tokens=True, padding=True,
+                          truncation=False, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        if fn_vector is not None:
+            # Apply interventions using hooks
+            def intervention_hook(module, input, output):
+                # Handle different output types
+                if isinstance(output, tuple):
+                    modified_output = output[0] - projection_einops(output[0], fn_vector)
+                    return (modified_output,) + output[1:]
+                else:
+                    return output - projection_einops(output, fn_vector)
+
+            # Register hooks on all layers
+            handles = []
+            for layer in base_model.model.layers:
+                # Hook on layer input/output
+                handles.append(layer.register_forward_hook(intervention_hook))
+                # Hook on self-attention output
+                handles.append(layer.self_attn.register_forward_hook(intervention_hook))
+                # Hook on MLP output
+                handles.append(layer.mlp.register_forward_hook(intervention_hook))
+
+            # Forward pass with interventions
+            with torch.no_grad():
+                outputs = base_model(**inputs)
+
+            # Clean up hooks
+            for handle in handles:
+                handle.remove()
+        else:
+            # Forward pass without interventions
+            with torch.no_grad():
+                outputs = base_model(**inputs)
+
+        # Get logits for last token
+        logits = outputs.logits[:, -1].detach().cpu()
+        all_logits.append(logits)
         torch.cuda.empty_cache()
+
     return torch.cat(all_logits, dim=0)
 
 def get_refusal_scores(model, prompts, refusal_toks, fn_vector=None, batch_size=8):
+    """
+    Get refusal scores with optional directional ablation.
+
+    Args:
+        model: HuggingFace model (or HookedModel)
+        prompts: List of prompt strings
+        refusal_toks: Token IDs that indicate refusal
+        fn_vector: Optional direction vector for ablation
+        batch_size: Batch size for processing
+
+    Returns:
+        Tensor of refusal scores
+    """
     all_scores = []
+
+    # Get the actual model and tokenizer
+    if hasattr(model, 'model'):
+        # HookedModel wrapper
+        base_model = model.model
+        tokenizer = model.tokenizer
+        device = model.device
+        dtype = model.dtype
+    else:
+        # Direct HuggingFace model
+        base_model = model
+        tokenizer = model.tokenizer
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+
     if fn_vector is not None:
         fn_vector = fn_vector / fn_vector.norm()
-        fn_vector = fn_vector.to(model.dtype).to(model.device)
-    
+        fn_vector = fn_vector.to(dtype).to(device)
+
     # Process prompts in batches
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i + batch_size]
-        with model.trace(batch_prompts):
-            if fn_vector is not None:
-                for layer in model.model.layers:
-                    layer.input -= projection_einops(layer.input, fn_vector)
-                    layer.self_attn.output[0][:] -= projection_einops(layer.self_attn.output[0][:], fn_vector)
-                    layer.mlp.output[:] -= projection_einops(layer.mlp.output[:], fn_vector)
-            logits = model.lm_head.output[:, -1]
-            scores = refusal_score_fn(logits, refusal_toks).save()
-        all_scores.append(scores.value.detach().cpu())
+
+        # Tokenize
+        inputs = tokenizer(batch_prompts, add_special_tokens=True, padding=True,
+                          truncation=False, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        if fn_vector is not None:
+            # Apply interventions using hooks
+            def intervention_hook(module, input, output):
+                # Handle different output types
+                if isinstance(output, tuple):
+                    modified_output = output[0] - projection_einops(output[0], fn_vector)
+                    return (modified_output,) + output[1:]
+                else:
+                    return output - projection_einops(output, fn_vector)
+
+            # Register hooks on all layers
+            handles = []
+            for layer in base_model.model.layers:
+                # Hook on layer input/output
+                handles.append(layer.register_forward_hook(intervention_hook))
+                # Hook on self-attention output
+                handles.append(layer.self_attn.register_forward_hook(intervention_hook))
+                # Hook on MLP output
+                handles.append(layer.mlp.register_forward_hook(intervention_hook))
+
+            # Forward pass with interventions
+            with torch.no_grad():
+                outputs = base_model(**inputs)
+
+            # Clean up hooks
+            for handle in handles:
+                handle.remove()
+        else:
+            # Forward pass without interventions
+            with torch.no_grad():
+                outputs = base_model(**inputs)
+
+        # Get logits for last token and compute refusal scores
+        logits = outputs.logits[:, -1]
+        scores = refusal_score_fn(logits, refusal_toks).detach().cpu()
+        all_scores.append(scores)
         torch.cuda.empty_cache()
-    
+
     return torch.cat(all_scores, dim=0)
 
 def get_induce_scores(model, prompts, refusal_toks, add_layer, fn_vector=None, batch_size=8):
+    """
+    Get refusal scores with activation addition at a specific layer.
+
+    Args:
+        model: HuggingFace model (or HookedModel)
+        prompts: List of prompt strings
+        refusal_toks: Token IDs that indicate refusal
+        add_layer: Layer index to add the vector to
+        fn_vector: Optional direction vector to add
+        batch_size: Batch size for processing
+
+    Returns:
+        Tensor of refusal scores
+    """
     all_scores = []
+
+    # Get the actual model and tokenizer
+    if hasattr(model, 'model'):
+        # HookedModel wrapper
+        base_model = model.model
+        tokenizer = model.tokenizer
+        device = model.device
+        dtype = model.dtype
+    else:
+        # Direct HuggingFace model
+        base_model = model
+        tokenizer = model.tokenizer
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+
     if fn_vector is not None:
-        fn_vector = fn_vector.to(model.dtype).to(model.device)
-    
+        fn_vector = fn_vector.to(dtype).to(device)
+
     # Process prompts in batches
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i + batch_size]
-        with model.trace(batch_prompts):
-            if fn_vector is not None:
-                model.model.layers[add_layer].input += fn_vector
-            logits = model.lm_head.output[:, -1]
-            scores = refusal_score_fn(logits, refusal_toks).detach().cpu().save()
-        all_scores.append(scores.value)
+
+        # Tokenize
+        inputs = tokenizer(batch_prompts, add_special_tokens=True, padding=True,
+                          truncation=False, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        if fn_vector is not None:
+            # Apply intervention using hook on specific layer
+            def intervention_hook(module, input, output):
+                # Add vector to output
+                if isinstance(output, tuple):
+                    modified_output = output[0] + fn_vector
+                    return (modified_output,) + output[1:]
+                else:
+                    return output + fn_vector
+
+            # Register hook on specific layer
+            handle = base_model.model.layers[add_layer].register_forward_hook(intervention_hook)
+
+            # Forward pass with intervention
+            with torch.no_grad():
+                outputs = base_model(**inputs)
+
+            # Clean up hook
+            handle.remove()
+        else:
+            # Forward pass without intervention
+            with torch.no_grad():
+                outputs = base_model(**inputs)
+
+        # Get logits for last token and compute refusal scores
+        logits = outputs.logits[:, -1]
+        scores = refusal_score_fn(logits, refusal_toks).detach().cpu()
+        all_scores.append(scores)
         torch.cuda.empty_cache()
-    
+
     return torch.cat(all_scores, dim=0)

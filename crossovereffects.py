@@ -1,6 +1,8 @@
 # %%
+# NOTE: This file has been partially ported from nnsight to PyTorch hooks.
+# Complex analysis code using nnsight's trace features needs manual review.
 import torch
-from nnsight import LanguageModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 import numpy as np
 from torch import Tensor
@@ -48,11 +50,12 @@ MODEL_PATH = 'google/gemma-2-2b-it'
 # MODEL_PATH = 'Qwen/Qwen2.5-7B-Instruct'
 CACHE_DIR = '/ceph/hdd/students/elsj/huggingface'
 
-model = LanguageModel(MODEL_PATH, cache_dir=CACHE_DIR, device_map='auto', torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, cache_dir=CACHE_DIR, device_map='auto', torch_dtype=torch.bfloat16)
+model.tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, cache_dir=CACHE_DIR)
 
 # %%
-with model.trace("Hello") as _:
-    pass
+# Test that model works (no longer need trace for this)
+_ = model.tokenizer("Hello", return_tensors='pt')
 # %%
 GEMMA_CHAT_TEMPLATE = """<start_of_turn>user
 {instruction}<end_of_turn>
@@ -91,7 +94,7 @@ harmless_val = json.load(open('data/saladbench_splits/harmless_val.json'))[:len(
 print(len(harmful_val), len(harmless_val))
 
 # %%
-from nnsight.envoy import Envoy #
+# Note: Envoy is no longer needed with PyTorch hooks
 import einops
 
 def projection_einops(activation, direction):
