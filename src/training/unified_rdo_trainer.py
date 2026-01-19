@@ -21,7 +21,7 @@ from typing import Dict, Optional, List
 from datasets import Dataset
 import random
 
-from unified_rdo_adapter import (
+from .unified_rdo_adapter import (
     get_unified_rdo_model,
     UnifiedRDOConfig,
     UnifiedRDOLayer,

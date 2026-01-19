@@ -21,7 +21,7 @@ import torch.nn as nn
 from typing import Optional, List, Literal
 from dataclasses import dataclass, field
 
-from projection_adapter import ProjectionConfig
+from .projection_adapter import ProjectionConfig
 
 
 @dataclass

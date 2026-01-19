@@ -224,6 +224,26 @@ class AdaptiveSparseGP:
             init = V[idx].detach().clone()
             self.inducing_points = torch.nn.Parameter(init)
 
+    def _stable_cholesky(self, K_base: torch.Tensor) -> torch.Tensor:
+        """Compute a stable Cholesky factor with jitter/eigen clamping."""
+        device = K_base.device
+        L = None
+        for scale in (1.0, 10.0, 1e2, 1e3):
+            K = K_base + (scale * self.jitter) * torch.eye(K_base.size(0), device=device)
+            try:
+                L = torch.linalg.cholesky(K)
+                break
+            except torch.linalg.LinAlgError:
+                L = None
+        if L is None:
+            # Last resort: symmetrize and clamp eigenvalues
+            K_sym = 0.5 * (K_base + K_base.T)
+            evals, evecs = torch.linalg.eigh(K_sym)
+            evals_clamped = torch.clamp(evals, min=self.jitter)
+            K = (evecs @ torch.diag(evals_clamped) @ evecs.T)
+            L = torch.linalg.cholesky(K)
+        return L
+
     def fit(self, V: torch.Tensor, R: torch.Tensor):
         """
         Fit sparse GP with adaptive inducing points.
@@ -249,8 +269,8 @@ class AdaptiveSparseGP:
             optimizer.zero_grad()
 
             Z = self.inducing_points
-            K_mm = self._kernel(Z, Z) + self.jitter * torch.eye(len(Z), device=device)
-            L_mm = torch.linalg.cholesky(K_mm)
+            K_mm_base = self._kernel(Z, Z)
+            L_mm = self._stable_cholesky(K_mm_base)
 
             K_nm = self._kernel(V_train, Z)  # [n, m]
             # Φ = K_nm K_mm^{-1/2}
@@ -279,8 +299,8 @@ class AdaptiveSparseGP:
         # Cache final state for prediction
         with torch.no_grad():
             Z = self.inducing_points
-            K_mm = self._kernel(Z, Z) + self.jitter * torch.eye(len(Z), device=device)
-            self.L_mm = torch.linalg.cholesky(K_mm)
+            K_mm_base = self._kernel(Z, Z)
+            self.L_mm = self._stable_cholesky(K_mm_base)
 
             K_nm = self._kernel(V_train, Z)
             tmp = torch.triangular_solve(K_nm.T, self.L_mm, upper=False).solution
@@ -440,7 +460,7 @@ class RefusalGeometryDiscovery:
             print(f"  Sample {i+1}/{self.config.n_init_random}: R = {R:.3f}")
 
         # Fit initial GP
-        V_tensor = torch.stack(self.V_observed)
+        V_tensor = torch.stack(self.V_observed).reshape(len(self.V_observed), -1)
         R_tensor = torch.tensor(self.R_observed)
         self.gp.fit(V_tensor, R_tensor)
 
@@ -466,7 +486,7 @@ class RefusalGeometryDiscovery:
             self.R_observed.append(R_next)
 
             # Update GP
-            V_tensor = torch.stack(self.V_observed)
+            V_tensor = torch.stack(self.V_observed).reshape(len(self.V_observed), -1)
             R_tensor = torch.tensor(self.R_observed)
             self.gp.fit(V_tensor, R_tensor)
 
