@@ -83,7 +83,7 @@ def forward_with_hooks(model: nn.Module, x: torch.Tensor, v: torch.Tensor) -> to
 # Approach 2: Weight Modifications (LoRA-style)
 # =============================================================================
 
-from utils.conversion_utils import (
+from src.utils.conversion_utils import (
     get_projection_matrix,
     VectorModifiedLayer
 )
@@ -355,7 +355,7 @@ def test_with_real_model():
         handle.remove()
 
         # Method 2: VectorModifiedLayer wrapper
-        from utils.conversion_utils import VectorModifiedLayer
+        from src.utils.conversion_utils import VectorModifiedLayer
 
         wrapped_layer = VectorModifiedLayer(layer, ablation_vector=v.detach())
         out2 = wrapped_layer(x)
@@ -388,8 +388,8 @@ def test_backward_compatibility():
     print("Test 5: Backward Compatibility")
     print("=" * 70)
 
-    from utils.conversion_utils import convert_model_to_vector_modified
-    from training.per_layer_training import PerLayerRefusalVectors
+    from src.utils.conversion_utils import convert_model_to_vector_modified
+    from src.training.per_layer_training import PerLayerRefusalVectors
 
     # Create model
     torch.manual_seed(42)
@@ -413,7 +413,7 @@ def test_backward_compatibility():
         print(f"✓ Vector extraction works")
 
         # Can create modified layer
-        from utils.conversion_utils import VectorModifiedLayer
+        from src.utils.conversion_utils import VectorModifiedLayer
         wrapped = VectorModifiedLayer(model, ablation_vector=v)
         print(f"✓ Layer wrapping works")
 
