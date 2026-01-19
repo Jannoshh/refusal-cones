@@ -156,6 +156,52 @@ def download_alpaca():
     dataset_json = [{'instruction': instruction.strip(), 'category': None} for instruction in instructions]
     dump_json(dataset_json, processed_file_path)
 
+def download_circuit_breakers():
+    """Download Circuit Breaker datasets from GraySwanAI."""
+    base_url = 'https://raw.githubusercontent.com/GraySwanAI/circuit-breakers/main/data'
+
+    files = [
+        ('circuit_breakers_train.json', 'circuit_breakers_train.json'),
+        ('circuit_breakers_val.json', 'circuit_breakers_val.json'),
+        ('harmbench_test.json', 'cb_harmbench_test.json'),  # Rename to avoid collision
+    ]
+
+    for remote_name, local_name in files:
+        url = f'{base_url}/{remote_name}'
+        raw_path = os.path.join(raw_data_dir, local_name)
+        processed_path = os.path.join(processed_data_dir, local_name)
+
+        download_file(url, raw_path)
+
+        with open(raw_path, 'r') as f:
+            data = json.load(f)
+
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError(f"Expected non-empty list in {remote_name}, got {type(data)}")
+
+        # Convert to standard format
+        if 'harmbench' in local_name:
+            # Test format: use behavior as instruction, default_target as target
+            required_keys = {'behavior', 'default_target'}
+            if not required_keys.issubset(data[0].keys()):
+                raise KeyError(f"Missing keys in {remote_name}: expected {required_keys}, got {data[0].keys()}")
+            processed = [
+                {'instruction': item['behavior'], 'target': item['default_target'], 'category': None}
+                for item in data
+            ]
+        else:
+            # Train/val format: use prompt as instruction, output as target
+            required_keys = {'prompt', 'output'}
+            if not required_keys.issubset(data[0].keys()):
+                raise KeyError(f"Missing keys in {remote_name}: expected {required_keys}, got {data[0].keys()}")
+            processed = [
+                {'instruction': item['prompt'], 'target': item['output'], 'category': None}
+                for item in data
+            ]
+
+        dump_json(processed, processed_path)
+        print(f"Downloaded {remote_name}: {len(processed)} examples")
+
 # %%
 download_advbench()
 download_malicious_instruct()
@@ -164,6 +210,7 @@ download_jailbreakbench()
 download_harmbench(split='val')
 download_harmbench(split='test')
 download_strongreject()
+download_circuit_breakers()
 
 download_alpaca()
 
@@ -174,71 +221,29 @@ download_alpaca()
 current_dir = os.path.abspath("")
 splits_data_dir = os.path.join(current_dir, 'splits')
 
-max_train_subset_size = 128 # limits the number of examples from a single dataset
-
-def filter_instructions(source_instructions, filter_instructions):
-    filtered_instructions = []
-    filter_set = set(x['instruction'] for x in filter_instructions)
-    for instruction in source_instructions:
-        if instruction['instruction'] not in filter_set:
-            filtered_instructions.append(instruction)
-    return filtered_instructions
-
 def construct_harmful_dataset_splits():
+    """Construct harmful dataset splits using Circuit Breaker data."""
     harmful_train_path = os.path.join(splits_data_dir, 'harmful_train.json')
     harmful_val_path = os.path.join(splits_data_dir, 'harmful_val.json')
     harmful_test_path = os.path.join(splits_data_dir, 'harmful_test.json')
-    jailbreak_val_path = os.path.join(splits_data_dir, 'jailbreak_val.json')
-    jailbreak_test_path = os.path.join(splits_data_dir, 'jailbreak_test.json')
 
-    harmful_train_instructions = []
-    for file in ['advbench.json', 'malicious_instruct.json', 'tdc2023.json']:
-        with open(os.path.join(processed_data_dir, file), 'r') as f:
-            data = json.load(f)
-            if len(data) > max_train_subset_size:
-                data = random.sample(data, max_train_subset_size)
-            harmful_train_instructions.extend(data)
-    
-    harmful_instructions = []
-    for file in ['strongreject.json']:
-        with open(os.path.join(processed_data_dir, file), 'r') as f:
-            harmful_instructions.extend(json.load(f))
+    # Load Circuit Breaker data directly
+    with open(os.path.join(processed_data_dir, 'circuit_breakers_train.json'), 'r') as f:
+        harmful_train = json.load(f)
 
-    jailbreak_val_instructions = []
-    for file in ['advbench.json']:
-        with open(os.path.join(processed_data_dir, file), 'r') as f:
-            data = json.load(f)
-            jailbreak_val_instructions.extend(data)
+    with open(os.path.join(processed_data_dir, 'circuit_breakers_val.json'), 'r') as f:
+        harmful_val = json.load(f)
 
-    jailbreak_test_instructions = []
-    for file in ['jailbreakbench.json']:
-        with open(os.path.join(processed_data_dir, file), 'r') as f:
-            data = json.load(f)
-            jailbreak_test_instructions.extend(data)
+    with open(os.path.join(processed_data_dir, 'cb_harmbench_test.json'), 'r') as f:
+        harmful_test = json.load(f)
 
-    jailbreak_val_instructions = filter_instructions(jailbreak_val_instructions, harmful_train_instructions + harmful_instructions + jailbreak_test_instructions)
+    dump_json(harmful_train, harmful_train_path)
+    dump_json(harmful_val, harmful_val_path)
+    dump_json(harmful_test, harmful_test_path)
 
-    harmful_instructions = filter_instructions(harmful_instructions, harmful_train_instructions + jailbreak_val_instructions + jailbreak_test_instructions)
-
-    harmful_train_instructions = filter_instructions(harmful_train_instructions, harmful_instructions + jailbreak_val_instructions + jailbreak_test_instructions)
-
-    random.seed(42)
-    random.shuffle(harmful_instructions)
-    harmful_val_instructions = harmful_instructions[:len(harmful_instructions)//2]
-    harmful_test_instructions = harmful_instructions[len(harmful_instructions)//2:]
-
-    dump_json(harmful_train_instructions, harmful_train_path)
-    dump_json(harmful_val_instructions, harmful_val_path)
-    dump_json(harmful_test_instructions, harmful_test_path)
-    dump_json(jailbreak_val_instructions, jailbreak_val_path)
-    dump_json(jailbreak_test_instructions, jailbreak_test_path)
-
-    # print length of every dataset
-    print(f'harmful_train_instructions: {len(harmful_train_instructions)}')
-    print(f'harmful_val_instructions: {len(harmful_val_instructions)}')
-    print(f'harmful_test_instructions: {len(harmful_test_instructions)}')
-    print(f'jailbreak_val_instructions: {len(jailbreak_val_instructions)}')
-    print(f'jailbreak_test_instructions: {len(jailbreak_test_instructions)}')
+    print(f'harmful_train: {len(harmful_train)}')
+    print(f'harmful_val: {len(harmful_val)}')
+    print(f'harmful_test: {len(harmful_test)}')
 
 def construct_harmless_dataset_splits():
     harmless_train_path = os.path.join(splits_data_dir, 'harmless_train.json')
