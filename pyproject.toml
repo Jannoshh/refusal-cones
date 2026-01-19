@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refusal-cones"
+version = "0.1.0"
+description = "Adaptive geometry discovery for refusal vector training"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "peft>=0.5",
+    "datasets>=2.0",
+    "scikit-learn>=1.0",
+    "scipy>=1.10",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "einops>=0.6",
+    "jaxtyping>=0.2",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "tabulate>=0.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"

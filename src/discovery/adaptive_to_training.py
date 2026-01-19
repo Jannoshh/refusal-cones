@@ -15,9 +15,9 @@ Answer: Only if discovered geometry is low-dimensional and simple!
 import torch
 from typing import Callable
 
-from adaptive_geometry_discovery import RefusalGeometryDiscovery, GeometryConfig
-from rdo_peft_adapter import get_rdo_model, RDOConfig, get_cone_model
-from rdo_peft_trainer import train_rdo_with_peft
+from .adaptive_geometry_discovery import RefusalGeometryDiscovery, GeometryConfig
+from training.rdo_peft_adapter import get_rdo_model, RDOConfig, get_cone_model
+from training.rdo_peft_trainer import train_rdo_with_peft
 
 
 def adaptive_discovery_to_training_pipeline(

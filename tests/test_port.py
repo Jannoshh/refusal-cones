@@ -6,14 +6,18 @@ Tests basic functionality of the ported code.
 
 import torch
 import sys
+from pathlib import Path
+
+# Get the src directory path for file checks
+SRC_DIR = Path(__file__).parent.parent / "src"
 
 def test_imports():
     """Test that all necessary imports work."""
     print("Testing imports...")
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        import scoring
-        import generate_utils
+        from measurement import scoring
+        from utils import generate_utils
         print("✓ All imports successful")
         return True
     except Exception as e:
@@ -24,7 +28,7 @@ def test_scoring_functions():
     """Test that scoring functions are correctly defined."""
     print("\nTesting scoring functions...")
     try:
-        from scoring import get_logits, get_refusal_scores, get_induce_scores, refusal_score_fn
+        from measurement.scoring import get_logits, get_refusal_scores, get_induce_scores, refusal_score_fn
         print("✓ All scoring functions imported")
 
         # Check function signatures
@@ -42,7 +46,7 @@ def test_generate_utils():
     """Test that generation utilities are correctly defined."""
     print("\nTesting generation utilities...")
     try:
-        from generate_utils import (
+        from utils.generate_utils import (
             generate_completions,
             intervene_with_fn_vector_ablation,
             intervene_with_fn_vector_addition,
@@ -65,8 +69,8 @@ def test_model_utils():
     """Test that model utilities module exists and is importable."""
     print("\nTesting model utilities...")
     try:
-        import model_utils
-        from model_utils import HookedModel
+        from utils import model_utils
+        from utils.model_utils import HookedModel
         print("✓ model_utils module imported successfully")
         return True
     except Exception as e:
@@ -77,22 +81,21 @@ def test_no_nnsight_imports():
     """Verify that nnsight is not imported in key files."""
     print("\nChecking for nnsight imports...")
     files_to_check = [
-        'scoring.py',
-        'generate_utils.py',
+        SRC_DIR / 'measurement' / 'scoring.py',
+        SRC_DIR / 'utils' / 'generate_utils.py',
     ]
 
     all_clean = True
-    for filename in files_to_check:
+    for filepath in files_to_check:
         try:
-            with open(filename, 'r') as f:
-                content = f.read()
-                if 'from nnsight' in content or 'import nnsight' in content:
-                    print(f"✗ {filename} still has nnsight imports")
-                    all_clean = False
-                else:
-                    print(f"✓ {filename} has no nnsight imports")
+            content = filepath.read_text()
+            if 'from nnsight' in content or 'import nnsight' in content:
+                print(f"✗ {filepath.name} still has nnsight imports")
+                all_clean = False
+            else:
+                print(f"✓ {filepath.name} has no nnsight imports")
         except FileNotFoundError:
-            print(f"⚠ {filename} not found")
+            print(f"⚠ {filepath} not found")
 
     return all_clean
 

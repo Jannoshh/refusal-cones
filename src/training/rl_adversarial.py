@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 
-from per_layer_training import PerLayerRefusalVectors
+from .per_layer_training import PerLayerRefusalVectors
 
 
 class HarmfulnessRewardModel:

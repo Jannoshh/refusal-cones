@@ -24,7 +24,7 @@ from typing import Dict, Optional, List
 from datasets import Dataset
 import random
 
-from rdo_peft_adapter import get_rdo_model, RDOConfig, RDOProjectionLayer, ConeProjectionLayer
+from .rdo_peft_adapter import get_rdo_model, RDOConfig, RDOProjectionLayer, ConeProjectionLayer
 
 
 class RDOTrainer(Trainer):

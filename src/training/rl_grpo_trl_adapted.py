@@ -36,7 +36,7 @@ except ImportError:
         learning_rate: float = 1e-4
         max_grad_norm: float = 1.0
 
-from per_layer_training import PerLayerRefusalVectors, projection_einops
+from .per_layer_training import PerLayerRefusalVectors, projection_einops
 
 
 class VectorGRPOTrainer:

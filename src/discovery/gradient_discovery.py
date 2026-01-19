@@ -18,7 +18,7 @@ import numpy as np
 from typing import Callable, List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
-from adaptive_geometry_discovery import SimpleGP, GeometryConfig
+from .adaptive_geometry_discovery import SimpleGP, GeometryConfig
 
 
 @dataclass
