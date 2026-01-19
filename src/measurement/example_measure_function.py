@@ -25,8 +25,7 @@ def measure_refusal_with_grad(
     tokenizer,
     harmful_prompts: List[str],
     classifier: callable,
-    batch_size: int = 8,        # ← KEY PARAMETER
-    num_batches: int = 2,       # ← Average over multiple batches
+    batch_size: int = 16,
     target_layers: List[int] = None,
     verbose: bool = False
 ) -> Tuple[float, torch.Tensor]:
@@ -39,8 +38,7 @@ def measure_refusal_with_grad(
         tokenizer: Tokenizer
         harmful_prompts: Pool of harmful prompts to test
         classifier: Function scoring harmfulness (HarmBench, etc.)
-        batch_size: Number of prompts per forward pass (controls gradient variance)
-        num_batches: Number of batches to average over (reduces variance)
+        batch_size: Number of prompts per forward pass
         target_layers: Which layers to apply ablation (None = all)
         verbose: Print progress
 
@@ -61,130 +59,111 @@ def measure_refusal_with_grad(
     if target_layers is None:
         target_layers = list(range(len(model.model.layers)))
 
-    # Accumulators
-    R_samples = []
-    grad_accumulator = torch.zeros_like(v)
+    # Sample random prompts for this batch
+    import random
+    batch_prompts = random.sample(harmful_prompts, min(batch_size, len(harmful_prompts)))
 
-    for batch_idx in range(num_batches):
-        if verbose:
-            print(f"  Batch {batch_idx + 1}/{num_batches}:")
+    # Tokenize
+    inputs = tokenizer(
+        batch_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512
+    ).to(model.device)
 
-        # Sample random prompts for this batch
-        import random
-        batch_prompts = random.sample(harmful_prompts, min(batch_size, len(harmful_prompts)))
+    # Register hooks for ablation
+    handles = []
 
-        # Tokenize
-        inputs = tokenizer(
-            batch_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512
-        ).to(model.device)
+    def make_ablation_hook(layer_idx):
+        """Create hook that ablates v[layer_idx] from activations."""
 
-        # Register hooks for ablation
-        handles = []
+        def hook(module, input, output):
+            # output is typically (hidden_states, ...) tuple or just hidden_states
+            if isinstance(output, tuple):
+                h = output[0]
+            else:
+                h = output
 
-        def make_ablation_hook(layer_idx):
-            """Create hook that ablates v[layer_idx] from activations."""
+            # Get layer-specific vector
+            v_layer = v[layer_idx]  # [hidden_dim]
 
-            def hook(module, input, output):
-                # output is typically (hidden_states, ...) tuple or just hidden_states
-                if isinstance(output, tuple):
-                    h = output[0]
-                else:
-                    h = output
+            # Normalize
+            v_normalized = v_layer / (v_layer.norm() + 1e-8)
 
-                # Get layer-specific vector
-                v_layer = v[layer_idx]  # [hidden_dim]
+            # Project out: h' = h - (h·v)v
+            projection = torch.einsum('...d,d->...', h, v_normalized)
+            h_ablated = h - torch.einsum('...,d->...d', projection, v_normalized)
 
-                # Normalize
-                v_normalized = v_layer / (v_layer.norm() + 1e-8)
+            # Return modified output
+            if isinstance(output, tuple):
+                return (h_ablated,) + output[1:]
+            else:
+                return h_ablated
 
-                # Project out: h' = h - (h·v)v
-                projection = torch.einsum('...d,d->...', h, v_normalized)
-                h_ablated = h - torch.einsum('...,d->...d', projection, v_normalized)
+        return hook
 
-                # Return modified output
-                if isinstance(output, tuple):
-                    return (h_ablated,) + output[1:]
-                else:
-                    return h_ablated
+    # Register hooks
+    for layer_idx in target_layers:
+        layer = model.model.layers[layer_idx]
+        handle = layer.register_forward_hook(make_ablation_hook(layer_idx))
+        handles.append(handle)
 
-            return hook
-
-        # Register hooks
-        for layer_idx in target_layers:
-            layer = model.model.layers[layer_idx]
-            handle = layer.register_forward_hook(make_ablation_hook(layer_idx))
-            handles.append(handle)
-
-        try:
-            # Generate with ablation active
-            with torch.no_grad():
-                # Don't need gradients during generation (only during scoring)
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=100,
-                    do_sample=False,  # Deterministic for stability
-                    pad_token_id=tokenizer.pad_token_id
-                )
-
-            # Decode responses
-            responses = tokenizer.batch_decode(
-                outputs[:, inputs['input_ids'].shape[1]:],  # Only new tokens
-                skip_special_tokens=True
+    try:
+        # Generate with ablation active
+        with torch.no_grad():
+            # Don't need gradients during generation (only during scoring)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                do_sample=False,  # Deterministic for stability
+                pad_token_id=tokenizer.pad_token_id
             )
 
-            # Score harmfulness
-            # Classifier returns scores ∈ [0, 1]
-            # 1.0 = harmful/complied (bad for refusal)
-            # 0.0 = refused/safe (good for refusal)
-            scores = classifier(batch_prompts, responses)  # [batch_size]
+        # Decode responses
+        responses = tokenizer.batch_decode(
+            outputs[:, inputs['input_ids'].shape[1]:],  # Only new tokens
+            skip_special_tokens=True
+        )
 
-            if not isinstance(scores, torch.Tensor):
-                scores = torch.tensor(scores, dtype=torch.float32, device=model.device)
+        # Score harmfulness
+        # Classifier returns scores ∈ [0, 1]
+        # 1.0 = harmful/complied (bad for refusal)
+        # 0.0 = refused/safe (good for refusal)
+        scores = classifier(batch_prompts, responses)  # [batch_size]
 
-            # Refusal rate: fraction that refused
-            # (We flip the scores since we want high score = refused)
-            R_batch = (scores < 0.5).float().mean()
+        if not isinstance(scores, torch.Tensor):
+            scores = torch.tensor(scores, dtype=torch.float32, device=model.device)
 
-            if verbose:
-                print(f"    Scores: {scores.tolist()}")
-                print(f"    R = {R_batch.item():.4f}")
+        # Refusal rate: fraction that refused
+        # (We flip the scores since we want high score = refused)
+        R = (scores < 0.5).float().mean()
 
-            # For gradient computation, we need differentiable version
-            # Use soft threshold instead of hard (scores < 0.5)
-            # R_soft = sigmoid((0.5 - scores) / temperature)
-            temperature = 0.1
-            R_soft = torch.sigmoid((0.5 - scores) / temperature).mean()
+        if verbose:
+            print(f"  Scores: {scores.tolist()}")
+            print(f"  R = {R.item():.4f}")
 
-            # Backprop
-            R_soft.backward()
+        # For gradient computation, we need differentiable version
+        # Use soft threshold instead of hard (scores < 0.5)
+        # R_soft = sigmoid((0.5 - scores) / temperature)
+        temperature = 0.1
+        R_soft = torch.sigmoid((0.5 - scores) / temperature).mean()
 
-            # Store
-            R_samples.append(R_batch.item())
-            if v.grad is not None:
-                grad_accumulator += v.grad / num_batches
+        # Backprop
+        R_soft.backward()
 
-            # Zero gradient for next batch
-            if v.grad is not None:
-                v.grad.zero_()
+        # Get gradient
+        grad = v.grad.clone() if v.grad is not None else torch.zeros_like(v)
 
-        finally:
-            # Remove hooks
-            for handle in handles:
-                handle.remove()
+        if verbose:
+            print(f"  Gradient norm = {grad.norm():.6f}")
 
-    # Final estimates
-    R = np.mean(R_samples)
-    grad = grad_accumulator
+    finally:
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
 
-    if verbose:
-        print(f"  Final R = {R:.4f}")
-        print(f"  Gradient norm = {grad.norm():.6f}")
-
-    return R, grad
+    return R.item(), grad
 
 
 def measure_refusal_with_grad_simple(
@@ -282,19 +261,19 @@ def example_usage():
 
     # Test different batch sizes
     print("\nComparing batch sizes:")
-    print(f"{'Batch Size':<12} {'Num Batches':<12} {'Total Prompts':<15} {'R':<10} {'||∇R||':<12} {'Time':<10}")
-    print("-" * 70)
+    print(f"{'Batch Size':<12} {'R':<10} {'||∇R||':<12} {'Time':<10}")
+    print("-" * 50)
 
     import time
 
     configs = [
-        (4, 1, "Fast but noisy"),
-        (8, 2, "Balanced"),
-        (16, 2, "Stable"),
-        (32, 1, "Very stable but slow")
+        (4, "Fast but noisy"),
+        (8, "Balanced"),
+        (16, "Stable"),
+        (32, "Very stable but slow")
     ]
 
-    for batch_size, num_batches, description in configs:
+    for batch_size, description in configs:
         start = time.time()
 
         R, grad = measure_refusal_with_grad(
@@ -304,21 +283,18 @@ def example_usage():
             harmful_prompts=harmful_prompts,
             classifier=mock_classifier,
             batch_size=batch_size,
-            num_batches=num_batches,
             verbose=False
         )
 
         elapsed = time.time() - start
 
-        total_prompts = batch_size * num_batches
-
-        print(f"{batch_size:<12} {num_batches:<12} {total_prompts:<15} {R:<10.4f} {grad.norm():<12.6f} {elapsed:<10.1f}s")
+        print(f"{batch_size:<12} {R:<10.4f} {grad.norm():<12.6f} {elapsed:<10.1f}s")
         print(f"  → {description}")
 
     print("\n" + "=" * 70)
     print("Recommendations:")
-    print("  • Discovery: batch_size=8, num_batches=2 (balanced)")
-    print("  • Training: batch_size=4, gradient_accumulation=4 (memory efficient)")
+    print("  • Discovery: batch_size=16 (balanced)")
+    print("  • Training: batch_size=8 (memory efficient)")
     print("  • Evaluation: batch_size=32 (accurate)")
 
 
@@ -344,8 +320,7 @@ def example_usage_in_discovery():
             tokenizer=tokenizer,
             harmful_prompts=harmful_prompts,
             classifier=classifier,
-            batch_size=8,      # ← Recommended for discovery
-            num_batches=2,     # ← Total 16 prompts per measurement
+            batch_size=16,     # ← Recommended for discovery
             verbose=False
         )
 
@@ -382,14 +357,10 @@ if __name__ == '__main__':
     print("     - Small (4-8): Noisy but fast")
     print("     - Large (32+): Stable but slow")
     print()
-    print("  2. Can average over multiple batches:")
-    print("     - batch_size=8, num_batches=2 → 16 total prompts")
-    print("     - Lower variance than single batch of 16")
-    print()
-    print("  3. Recommendations:")
-    print("     - Discovery: 8×2 = 16 prompts (balanced)")
-    print("     - Training: 4×4 = 16 prompts (via gradient accumulation)")
-    print("     - Evaluation: 32+ prompts (accurate)")
+    print("  2. Recommendations:")
+    print("     - Discovery: batch_size=16 (balanced)")
+    print("     - Training: batch_size=8 (memory efficient)")
+    print("     - Evaluation: batch_size=32+ (accurate)")
 
     print("\n" + "=" * 70)
     print("Run example_usage() to see timing comparison")

@@ -85,7 +85,6 @@ class HybridMeasurement:
         v: torch.Tensor,
         prompts: List[str],
         batch_size: int = 16,
-        num_batches: int = 1,
         verbose: bool = False
     ) -> Tuple[float, torch.Tensor]:
         """
@@ -95,7 +94,6 @@ class HybridMeasurement:
             v: Ablation vector [n_layers, hidden_dim]
             prompts: Pool of harmful prompts
             batch_size: Prompts per measurement
-            num_batches: Number of batches to average
             verbose: Print progress
 
         Returns:
@@ -109,28 +107,12 @@ class HybridMeasurement:
 
         v.requires_grad = True
 
-        R_samples = []
-        grad_accumulator = torch.zeros_like(v)
+        # Sample prompts
+        import random
+        batch_prompts = random.sample(prompts, min(batch_size, len(prompts)))
 
-        for batch_idx in range(num_batches):
-            if verbose:
-                print(f"  Batch {batch_idx + 1}/{num_batches}")
-
-            # Sample prompts
-            import random
-            batch_prompts = random.sample(prompts, min(batch_size, len(prompts)))
-
-            # Measure
-            R_batch, grad_batch = self._measure_single_batch(
-                v, batch_prompts, verbose
-            )
-
-            R_samples.append(R_batch)
-            grad_accumulator += grad_batch / num_batches
-
-        # Average
-        R = sum(R_samples) / len(R_samples)
-        grad = grad_accumulator
+        # Measure
+        R, grad = self._measure_single_batch(v, batch_prompts, verbose)
 
         return R, grad
 
@@ -383,8 +365,7 @@ def example_usage():
     R, grad = measurer.measure_refusal_with_grad(
         v=v,
         prompts=harmful_prompts,
-        batch_size=8,
-        num_batches=2,
+        batch_size=16,
         verbose=True
     )
     elapsed = time.time() - start
