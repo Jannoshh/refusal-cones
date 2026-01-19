@@ -416,13 +416,28 @@ Starter plan (free): **$30/month credits** — enough for:
 The recommended workflow for finding optimal refusal vectors:
 
 ```bash
-# 1. Run Pareto discovery (finds tradeoff between ablation and capability retention)
+# Easiest: Use the wrapper script (runs Modal + downloads results)
+uv run python scripts/run_pareto.py
+
+# High-budget run (more iterations)
+uv run python scripts/run_pareto.py --high-budget
+
+# Custom parameters
+uv run python scripts/run_pareto.py --n-init 50 --n-iter 100
+
+# Results are automatically saved to results/pareto_ace_TIMESTAMP/
+```
+
+**Manual workflow** (if you need more control):
+
+```bash
+# 1. Run Pareto discovery
 uv run modal run modal_app.py
 
 # 2. Download results from Modal volume
-uv run modal volume get refusal-cones-results pareto_plot_TIMESTAMP.png ./pareto_plot.png
-uv run modal volume get refusal-cones-results pareto_vectors_TIMESTAMP.pt ./pareto_vectors.pt
-uv run modal volume get refusal-cones-results pareto_discovery_TIMESTAMP.json ./results.json
+uv run modal volume get refusal-cones-results pareto_plot_TIMESTAMP.png ./results/pareto_plot.png
+uv run modal volume get refusal-cones-results pareto_vectors_TIMESTAMP.pt ./results/pareto_vectors.pt
+uv run modal volume get refusal-cones-results pareto_discovery_TIMESTAMP.json ./results/results.json
 
 # 3. List all files in volume
 uv run modal volume ls refusal-cones-results
