@@ -12,6 +12,41 @@ Key insight: We want vectors that:
 3. Can induce refusal on harmless prompts under intervention (high induce_score)
 
 The Pareto frontier contains all "optimal" trade-offs.
+
+## Theoretical Background: Refusal as Affine Function
+
+Refusal behavior is modeled as an affine function of layer activations:
+
+    R(h) = w · h + b
+
+where w is the "refusal direction" and b is a bias term. When we ablate
+by projecting out a direction v from activations:
+
+    h' = h - α(h · v̂)v̂    where v̂ = v/||v||, α = ||v|| (scale)
+
+The refusal score becomes:
+
+    R(h') = w · h - α(w · v̂)(h · v̂) + b
+
+Key observations:
+1. **Direction matters**: (w · v̂) measures alignment with refusal direction
+2. **Scale matters**: α controls how much we project out
+3. **Per-layer norms encode importance**: Larger ||v_layer|| = stronger ablation at that layer
+
+## Why Per-Layer Norms Matter
+
+The mean-difference method computes:
+
+    v_layer = mean(h_harmful) - mean(h_harmless)
+
+This gives natural per-layer norms:
+- Layers where harmful ≠ harmless get larger ||v|| → more ablation
+- Layers where harmful ≈ harmless get smaller ||v|| → less ablation
+
+When sampling/optimizing, we should NOT normalize per-layer (which forces
+||v_layer|| = 1 for all layers), as this destroys the layer importance signal.
+Instead, use global normalization (total ||v|| = 1) to preserve relative
+layer importance while keeping vectors comparable.
 """
 
 import torch
@@ -20,7 +55,7 @@ import numpy as np
 from typing import Callable, List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
-from .adaptive_geometry_discovery import SimpleGP, AdaptiveSparseGP
+from .adaptive_geometry_discovery import SimpleGP, AdaptiveSparseGP, StructuredLayerGP
 
 
 @dataclass
@@ -43,7 +78,7 @@ class ParetoDiscoveryConfig:
 
     # Acquisition
     acquisition_type: str = 'ehvi'  # Expected Hypervolume Improvement
-    beta: float = 1.96  # For UCB-based acquisition
+    beta: float = 0.5  # For UCB-based acquisition (lower = more exploitation)
     # Reference point: worst-case values for each objective
     # refusal_score: 0 is worst (no ablation effect), -10 is good
     # kl_score: high is worst (e.g., 10), 0 is good
@@ -56,12 +91,53 @@ class ParetoDiscoveryConfig:
     min_pareto_points: int = 10
 
     # GP settings (one per objective)
+    gp_type: str = 'simple'  # 'simple', 'sparse', or 'structured'
     kernel_type: str = 'rbf'
     kernel_lengthscale: float = 0.3
-    use_sparse_gp: bool = True
+    use_sparse_gp: bool = False  # Deprecated, use gp_type='sparse'
     num_inducing: int = 64
     sparse_train_steps: int = 10
     sparse_lr: float = 0.05
+
+    # Structured GP settings (gp_type='structured')
+    layer_lengthscale: float = 3.0  # Smoothness across ~3 adjacent layers
+    learn_layer_weights: bool = True  # ARD: learn per-layer importance
+
+    # Normalization
+    normalize_per_layer: bool = False  # If False, let optimizer learn layer norms
+
+
+@dataclass
+class AffineRefusalVector:
+    """
+    A complete affine refusal vector following ACE (Marshall et al., 2024).
+
+    The ACE intervention is: h' = h - proj_v(h) + proj_v(v⁻) + α*v
+
+    Attributes:
+        v: [n_layers, hidden_dim] - The refusal direction (ablation direction)
+        v_minus: [n_layers, hidden_dim] - Reference point (mean harmless activations)
+        v_plus: [n_layers, hidden_dim] - Mean harmful activations (optional, for analysis)
+    """
+    v: torch.Tensor  # The direction to ablate
+    v_minus: torch.Tensor  # Reference point for ACE bias term
+    v_plus: Optional[torch.Tensor] = None  # Mean harmful (for analysis)
+
+    def to_dict(self) -> Dict[str, torch.Tensor]:
+        """Convert to dictionary for serialization."""
+        d = {'v': self.v, 'v_minus': self.v_minus}
+        if self.v_plus is not None:
+            d['v_plus'] = self.v_plus
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, torch.Tensor]) -> 'AffineRefusalVector':
+        """Create from dictionary."""
+        return cls(
+            v=d['v'],
+            v_minus=d['v_minus'],
+            v_plus=d.get('v_plus')
+        )
 
 
 @dataclass
@@ -88,13 +164,32 @@ class ParetoDiscoveryResults:
 
     n_measurements: int
 
+    # ACE reference points (shared across all vectors in this run)
+    v_minus: Optional[torch.Tensor] = None  # [n_layers, hidden_dim] mean harmless
+    v_plus: Optional[torch.Tensor] = None   # [n_layers, hidden_dim] mean harmful
+
+    def get_pareto_affine_vectors(self) -> List[AffineRefusalVector]:
+        """Get Pareto vectors as full AffineRefusalVector objects."""
+        if self.v_minus is None:
+            raise ValueError("v_minus not available - was discovery run with ACE?")
+
+        return [
+            AffineRefusalVector(
+                v=self.pareto_vectors[i],
+                v_minus=self.v_minus,
+                v_plus=self.v_plus
+            )
+            for i in range(len(self.pareto_vectors))
+        ]
+
 
 class MultiObjectiveScorer:
     """
     Compute multiple objective scores efficiently using forward passes only.
 
     NO GENERATION NEEDED - just:
-    1. Forward pass on harmful prompts -> refusal token logits
+    1. Forward pass on harmful prompts -> refusal token logits OR
+       Forward pass on harmful prompt+completion -> completion loss
     2. Forward pass on harmless prompts -> KL from baseline
 
     Time per measurement: ~0.2-0.5s (vs ~5-10s with generation)
@@ -107,20 +202,61 @@ class MultiObjectiveScorer:
         harmful_prompts: List[str],
         harmless_prompts: List[str],
         refusal_toks: torch.Tensor,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        harmful_completions: Optional[List[str]] = None,
+        n_score_tokens: int = 1
     ):
+        """
+        Initialize the multi-objective scorer.
+
+        Args:
+            model: HuggingFace model
+            tokenizer: Tokenizer
+            harmful_prompts: Prompts for refusal measurement
+            harmless_prompts: Prompts for retain measurement
+            refusal_toks: Token IDs indicating refusal
+            device: Device to use
+            harmful_completions: Optional harmful completions to compute loss on.
+                If provided, loss is computed on completion tokens instead of
+                just the next-token refusal logits.
+            n_score_tokens: Number of completion tokens to compute loss on.
+                Only used when harmful_completions is provided. Set to -1 to
+                use all completion tokens.
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.harmful_prompts = harmful_prompts
         self.harmless_prompts = harmless_prompts
         self.refusal_toks = refusal_toks.to(device)
         self.device = device
+        self.harmful_completions = harmful_completions
+        self.n_score_tokens = n_score_tokens
 
         # Pre-tokenize prompts for speed
         self._prepare_inputs()
 
         # Cache baseline logits for KL computation
         self._cache_baselines()
+
+        # ACE reference point (v⁻) - computed lazily
+        self._v_minus: Optional[torch.Tensor] = None
+        self._v_plus: Optional[torch.Tensor] = None
+        self._v_minus_computed: bool = False
+
+    def _ensure_v_minus_cached(self) -> torch.Tensor:
+        """
+        Lazily compute and cache the ACE reference point v⁻.
+
+        v⁻ is the mean harmless activations, used as the reference point
+        in the ACE formula: h' = h - proj_v(h) + proj_v(v⁻) + α*v
+        """
+        if not self._v_minus_computed:
+            # Use compute_mean_diff_vector which returns (v, v_minus, v_plus)
+            _, v_minus, v_plus = self.compute_mean_diff_vector()
+            self._v_minus = v_minus
+            self._v_plus = v_plus
+            self._v_minus_computed = True
+        return self._v_minus
 
     def _prepare_inputs(self):
         """Pre-tokenize prompts for faster scoring."""
@@ -139,6 +275,57 @@ class MultiObjectiveScorer:
             truncation=True,
             max_length=512
         ).to(self.device)
+
+        # If harmful completions provided, tokenize prompt+completion
+        # and track where the completion starts for each example
+        if self.harmful_completions is not None:
+            self._prepare_completion_inputs()
+
+    def _prepare_completion_inputs(self):
+        """Prepare inputs for multi-token completion scoring."""
+        # Tokenize prompts alone to get prompt lengths
+        prompt_encodings = self.tokenizer(
+            self.harmful_prompts,
+            return_tensors='pt',
+            padding=False,
+            truncation=True,
+            max_length=256
+        )
+        self.prompt_lengths = [len(ids) for ids in prompt_encodings['input_ids']]
+
+        # Tokenize prompt + completion together
+        full_texts = [
+            p + c for p, c in zip(self.harmful_prompts, self.harmful_completions)
+        ]
+        self.harmful_full_inputs = self.tokenizer(
+            full_texts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
+        # Create labels for completion tokens only (mask out prompt tokens)
+        self.completion_labels = self.harmful_full_inputs['input_ids'].clone()
+        for i, prompt_len in enumerate(self.prompt_lengths):
+            # Mask prompt tokens with -100 (ignored in loss)
+            self.completion_labels[i, :prompt_len] = -100
+
+        # Determine how many completion tokens to score per example
+        completion_lengths = [
+            (self.completion_labels[i] != -100).sum().item()
+            for i in range(len(self.harmful_prompts))
+        ]
+        self.completion_lengths = completion_lengths
+
+        # If n_score_tokens is set, limit the tokens we score
+        if self.n_score_tokens > 0:
+            for i in range(len(self.harmful_prompts)):
+                prompt_len = self.prompt_lengths[i]
+                # Keep only first n_score_tokens of completion
+                mask_start = prompt_len + self.n_score_tokens
+                if mask_start < self.completion_labels.size(1):
+                    self.completion_labels[i, mask_start:] = -100
 
     def _last_nonpad_logits(self, outputs, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Select logits at each sequence's last non-padding token."""
@@ -165,6 +352,96 @@ class MultiObjectiveScorer:
             outputs = self.model(**self.harmless_inputs)
             self.baseline_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs).detach()
 
+    def compute_mean_diff_vector(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute refusal direction and reference points via mean-difference method.
+
+        Following "Refusal in LLMs is an Affine Function" (Marshall et al., 2024):
+        - r = v⁺ - v⁻ (refusal direction with natural norm)
+        - v⁻ = mean harmless activations (reference point for ACE)
+        - v⁺ = mean harmful activations
+
+        The ACE intervention for ablating with direction v is:
+            h' = h - proj_v(h) + proj_v(v⁻) + α*v
+
+        Where proj_v(v⁻) is the bias term that keeps activations in a sensible region.
+
+        Returns:
+            r: [n_layers, hidden_dim] mean-diff refusal direction (v⁺ - v⁻) with natural norms
+            v_minus: [n_layers, hidden_dim] mean harmless activations (reference point)
+            v_plus: [n_layers, hidden_dim] mean harmful activations
+        """
+        # Get layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            layers = self.model.model.layers
+        elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            layers = self.model.transformer.h
+        else:
+            raise ValueError("Unknown model architecture")
+
+        n_layers = len(layers)
+        hidden_dim = self._infer_hidden_dim(layers)
+
+        # Collect activations at last token position
+        harmful_acts = {i: [] for i in range(n_layers)}
+        harmless_acts = {i: [] for i in range(n_layers)}
+
+        def make_collector(storage, layer_idx):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    h = output[0]
+                else:
+                    h = output
+                # Get last token activation (simplified - assumes no padding issues)
+                storage[layer_idx].append(h[:, -1, :].detach())
+            return hook
+
+        # Collect harmful activations
+        handles = []
+        for i, layer in enumerate(layers):
+            handles.append(layer.register_forward_hook(make_collector(harmful_acts, i)))
+
+        with torch.no_grad():
+            self.model(**self.harmful_inputs)
+
+        for h in handles:
+            h.remove()
+
+        # Collect harmless activations
+        handles = []
+        for i, layer in enumerate(layers):
+            handles.append(layer.register_forward_hook(make_collector(harmless_acts, i)))
+
+        with torch.no_grad():
+            self.model(**self.harmless_inputs)
+
+        for h in handles:
+            h.remove()
+
+        # Compute means per layer
+        v_plus_layers = []  # Mean harmful (refusal)
+        v_minus_layers = []  # Mean harmless (non-refusal) - reference point
+        r_layers = []  # Difference (refusal direction)
+
+        for i in range(n_layers):
+            h_harmful = torch.cat(harmful_acts[i], dim=0).mean(dim=0)  # [hidden_dim]
+            h_harmless = torch.cat(harmless_acts[i], dim=0).mean(dim=0)
+            v_plus_layers.append(h_harmful)
+            v_minus_layers.append(h_harmless)
+            r_layers.append(h_harmful - h_harmless)
+
+        r = torch.stack(r_layers)  # [n_layers, hidden_dim] - mean-diff refusal direction
+        v_minus = torch.stack(v_minus_layers)  # [n_layers, hidden_dim] - reference point
+        v_plus = torch.stack(v_plus_layers)  # [n_layers, hidden_dim]
+
+        # Log per-layer norms (these encode layer importance!)
+        norms = r.norm(dim=1)
+        print(f"Mean-diff vector (r = v⁺ - v⁻) computed. Per-layer norms:")
+        print(f"  Min: {norms.min():.4f}, Max: {norms.max():.4f}, Mean: {norms.mean():.4f}")
+        print(f"  Top 5 layers by norm: {norms.argsort(descending=True)[:5].tolist()}")
+
+        return r, v_minus, v_plus
+
     def _infer_hidden_dim(self, layers) -> Optional[int]:
         """Infer hidden size from model config or layer norm weights."""
         if hasattr(self.model, 'config'):
@@ -181,8 +458,30 @@ class MultiObjectiveScorer:
 
         return None
 
-    def _apply_ablation_hooks(self, v: torch.Tensor) -> List:
-        """Register ablation hooks for vector v."""
+    def _apply_ablation_hooks(
+        self,
+        v: torch.Tensor,
+        v_minus: Optional[torch.Tensor] = None,
+        alpha: float = 0.0
+    ) -> List:
+        """
+        Register ACE (Affine Concept Editing) hooks for vector v.
+
+        Implements the ACE formula from Marshall et al. (2024):
+            h' = h - proj_v(h) + proj_v(v⁻) + α*v
+
+        Where:
+            - v = the ablation direction
+            - v⁻ = reference point (mean harmless activations)
+            - α = steering parameter (0 = ablate refusal, 1 = induce refusal)
+            - proj_v(x) = (x·v̂)v̂ where v̂ = v/||v||
+
+        Args:
+            v: Ablation direction [n_layers, hidden_dim]
+            v_minus: Reference point [n_layers, hidden_dim] (mean harmless activations)
+                     If None, falls back to simple directional ablation (no bias term).
+            alpha: Steering parameter. 0 = ablate refusal, 1 = induce refusal.
+        """
         handles = []
 
         # Determine number of layers
@@ -226,28 +525,48 @@ class MultiObjectiveScorer:
                 )
             v_per_layer = v
 
-        for layer_idx, layer in enumerate(layers):
-            # Get this layer's vector, move to device, and normalize
-            v_layer = v_per_layer[layer_idx].to(self.device)
-            v_layer = v_layer / (v_layer.norm() + 1e-8)
+        # Infer model dtype from model parameters (robust to parameterless layers like Identity)
+        try:
+            model_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.float32  # Default fallback
 
-            def make_hook(v_l):
+        for layer_idx, layer in enumerate(layers):
+            # Get this layer's refusal direction r
+            r_layer = v_per_layer[layer_idx].to(device=self.device, dtype=model_dtype)
+
+            # Compute unit vector r̂ = r / ||r||
+            r_norm = r_layer.norm() + 1e-8
+            r_unit = r_layer / r_norm
+
+            # Get reference point v⁻ for this layer (if provided)
+            if v_minus is not None:
+                v_minus_layer = v_minus[layer_idx].to(device=self.device, dtype=model_dtype)
+                # Compute proj_v(v⁻) = (v⁻·v̂)v̂
+                bias = torch.dot(v_minus_layer, r_unit) * r_unit
+            else:
+                bias = torch.zeros_like(r_unit)
+
+            def make_hook(r_u, r_l, b, a):
                 def hook(module, input, output):
                     if isinstance(output, tuple):
                         h = output[0]
                     else:
                         h = output
 
-                    # Project out: h' = h - (h·v)v
-                    proj = torch.einsum('...d,d->...', h, v_l)
-                    h_ablated = h - torch.einsum('...,d->...d', proj, v_l)
+                    # ACE: h' = h - proj_r(h) + proj_r(r⁻) + α*r
+                    # = h - (h·r̂)r̂ + bias + α*r
+                    proj_h = torch.einsum('...d,d->...', h, r_u)  # h·r̂
+                    h_ace = h - torch.einsum('...,d->...d', proj_h, r_u)  # h - proj_r(h)
+                    h_ace = h_ace + b  # + proj_r(r⁻) (bias term)
+                    h_ace = h_ace + a * r_l  # + α*r (steering term)
 
                     if isinstance(output, tuple):
-                        return (h_ablated,) + output[1:]
-                    return h_ablated
+                        return (h_ace,) + output[1:]
+                    return h_ace
                 return hook
 
-            handles.append(layer.register_forward_hook(make_hook(v_layer)))
+            handles.append(layer.register_forward_hook(make_hook(r_unit, r_layer, bias, alpha)))
 
         return handles
 
@@ -280,27 +599,62 @@ class MultiObjectiveScorer:
         if return_grad:
             v_flat = v_flat.clone().detach().requires_grad_(True)
 
-        # Register ablation hooks
-        handles = self._apply_ablation_hooks(v_flat)
+        # Get ACE reference point (cached)
+        v_minus = self._ensure_v_minus_cached()
+
+        # Register ACE ablation hooks (alpha=0 for ablation)
+        handles = self._apply_ablation_hooks(v_flat, v_minus=v_minus, alpha=0.0)
 
         try:
-            # === Forward pass 1: Harmful prompts (refusal score) ===
-            if return_grad:
-                outputs = self.model(**self.harmful_inputs)
+            # === Forward pass 1: Harmful prompts (refusal score or completion loss) ===
+            if self.harmful_completions is not None:
+                # Multi-token completion scoring
+                if return_grad:
+                    outputs = self.model(**self.harmful_full_inputs)
+                else:
+                    with torch.no_grad():
+                        outputs = self.model(**self.harmful_full_inputs)
+
+                # Compute cross-entropy loss on completion tokens
+                # Shift logits and labels for next-token prediction
+                logits = outputs.logits[:, :-1, :].contiguous()
+                labels = self.completion_labels[:, 1:].contiguous()
+
+                # Compute per-token loss
+                loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+                per_token_loss = loss_fct(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1)
+                ).view(logits.size(0), logits.size(1))
+
+                # Average over valid completion tokens per example
+                valid_mask = (labels != -100).float()
+                per_example_loss = (per_token_loss * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)
+
+                # Refusal score: negative loss (lower loss = model complies = lower score)
+                # We want to MINIMIZE refusal_score, so negative loss works
+                # Actually: higher loss = more refusal, lower loss = more compliance
+                # For consistency: refusal_score = loss (high = refusing, low = complying)
+                refusal_logits = per_example_loss
+                scores['refusal_score'] = per_example_loss.mean().item()
             else:
-                with torch.no_grad():
+                # Original single-token refusal scoring
+                if return_grad:
                     outputs = self.model(**self.harmful_inputs)
+                else:
+                    with torch.no_grad():
+                        outputs = self.model(**self.harmful_inputs)
 
-            ablated_harmful_logits = self._last_nonpad_logits(outputs, self.harmful_inputs)
+                ablated_harmful_logits = self._last_nonpad_logits(outputs, self.harmful_inputs)
 
-            # Refusal score: logit(P_refusal) = log(P_r) - log(1 - P_r)
-            # Negative when ablation works well (e.g., -6)
-            # Uses the proper refusal_score_fn from scoring.py
-            refusal_logits = refusal_score_fn(
-                ablated_harmful_logits,
-                self.refusal_toks
-            )
-            scores['refusal_score'] = refusal_logits.mean().item()
+                # Refusal score: logit(P_refusal) = log(P_r) - log(1 - P_r)
+                # Negative when ablation works well (e.g., -6)
+                # Uses the proper refusal_score_fn from scoring.py
+                refusal_logits = refusal_score_fn(
+                    ablated_harmful_logits,
+                    self.refusal_toks
+                )
+                scores['refusal_score'] = refusal_logits.mean().item()
 
             # === Forward pass 2: Harmless prompts (KL score) ===
             if return_grad:
@@ -312,11 +666,14 @@ class MultiObjectiveScorer:
             ablated_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs)
 
             # KL divergence: KL(baseline || ablated)
-            p_baseline = torch.softmax(self.baseline_harmless_logits, dim=-1)
-            p_ablated = torch.softmax(ablated_harmless_logits, dim=-1)
+            # Use log_softmax for numerical stability
+            log_p_baseline = torch.log_softmax(self.baseline_harmless_logits.float(), dim=-1)
+            log_p_ablated = torch.log_softmax(ablated_harmless_logits.float(), dim=-1)
+            p_baseline = log_p_baseline.exp()
 
-            eps = 1e-8
-            kl = (p_baseline * (torch.log(p_baseline + eps) - torch.log(p_ablated + eps))).sum(dim=-1).mean()
+            kl = (p_baseline * (log_p_baseline - log_p_ablated)).sum(dim=-1).mean()
+            # Clamp to avoid NaN/Inf
+            kl = torch.clamp(kl, min=0.0, max=100.0)
             scores['kl_score'] = kl.item()
 
             # Induce score: refusal logit on harmless prompts under ablation
@@ -362,13 +719,27 @@ class ParetoGeometryDiscovery:
         n_layers: int,
         hidden_dim: int,
         config: Optional[ParetoDiscoveryConfig] = None,
-        v_init: Optional[torch.Tensor] = None
+        v_init: Optional[torch.Tensor] = None,
+        use_mean_diff_init: bool = True
     ):
         self.scorer = scorer
         self.n_layers = n_layers
         self.hidden_dim = hidden_dim
         self.config = config or ParetoDiscoveryConfig()
-        self.v_init = v_init
+
+        # Use mean-diff initialization if no v_init provided
+        if v_init is None and use_mean_diff_init:
+            print("Computing mean-diff initialization (natural per-layer norms)...")
+            # compute_mean_diff_vector returns (r, v_minus, v_plus)
+            # r = v_plus - v_minus is the mean-diff refusal direction
+            r, v_minus, v_plus = scorer.compute_mean_diff_vector()
+            self.v_init = r  # Use refusal direction as initial vector
+            # Cache v_minus/v_plus in the scorer for ACE
+            scorer._v_minus = v_minus
+            scorer._v_plus = v_plus
+            scorer._v_minus_computed = True
+        else:
+            self.v_init = v_init
 
         # Observations
         self.V_observed: List[torch.Tensor] = []
@@ -379,9 +750,23 @@ class ParetoGeometryDiscovery:
         }
 
         # One GP per objective
-        self.gps: Dict[str, Union[SimpleGP, AdaptiveSparseGP]] = {}
+        self.gps: Dict[str, Union[SimpleGP, AdaptiveSparseGP, StructuredLayerGP]] = {}
+
+        # Resolve GP type (handle legacy use_sparse_gp flag)
+        gp_type = self.config.gp_type
+        if self.config.use_sparse_gp and gp_type == 'simple':
+            gp_type = 'sparse'
+
         for obj in self.config.primary_objectives + self.config.secondary_objectives:
-            if self.config.use_sparse_gp:
+            if gp_type == 'structured':
+                self.gps[obj] = StructuredLayerGP(
+                    n_layers=n_layers,
+                    hidden_dim=hidden_dim,
+                    feature_lengthscale=self.config.kernel_lengthscale,
+                    layer_lengthscale=self.config.layer_lengthscale,
+                    learn_layer_weights=self.config.learn_layer_weights
+                )
+            elif gp_type == 'sparse':
                 self.gps[obj] = AdaptiveSparseGP(
                     kernel_type=self.config.kernel_type,
                     lengthscale=self.config.kernel_lengthscale,
@@ -394,6 +779,8 @@ class ParetoGeometryDiscovery:
                     kernel_type=self.config.kernel_type,
                     lengthscale=self.config.kernel_lengthscale
                 )
+
+        self.gp_type = gp_type
 
     def discover(self) -> ParetoDiscoveryResults:
         """Run multi-objective Pareto discovery."""
@@ -424,6 +811,15 @@ class ParetoGeometryDiscovery:
 
         return results
 
+    def _normalize_vector(self, v: torch.Tensor) -> torch.Tensor:
+        """Normalize vector according to config."""
+        if self.config.normalize_per_layer:
+            # Unit norm per layer
+            return v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+        else:
+            # Single global unit norm (preserves relative layer importance)
+            return v / (v.norm() + 1e-8)
+
     def _initial_exploration(self):
         """Phase 1: Initial stratified sampling."""
 
@@ -434,7 +830,7 @@ class ParetoGeometryDiscovery:
             else:
                 v = torch.randn(self.n_layers, self.hidden_dim)
 
-            v = v / v.norm(dim=-1, keepdim=True)
+            v = self._normalize_vector(v)
 
             # Score
             scores = self.scorer.score(v)
@@ -496,7 +892,7 @@ class ParetoGeometryDiscovery:
         # Uniform on sphere
         for _ in range(n_uniform):
             v = torch.randn(self.n_layers, self.hidden_dim)
-            v = v / v.norm(dim=-1, keepdim=True)
+            v = self._normalize_vector(v)
             candidates.append(v)
 
         # Near current Pareto points
@@ -508,12 +904,12 @@ class ParetoGeometryDiscovery:
                 idx = pareto_indices[torch.randint(len(pareto_indices), (1,))].item()
                 v_base = self.V_observed[idx]
                 v = v_base + 0.2 * torch.randn_like(v_base)
-                v = v / v.norm(dim=-1, keepdim=True)
+                v = self._normalize_vector(v)
                 candidates.append(v)
         else:
             for _ in range(n_near_pareto):
                 v = torch.randn(self.n_layers, self.hidden_dim)
-                v = v / v.norm(dim=-1, keepdim=True)
+                v = self._normalize_vector(v)
                 candidates.append(v)
 
         return torch.stack(candidates)
@@ -677,6 +1073,10 @@ class ParetoGeometryDiscovery:
             k = pareto_scores['kl_score'][i].item()
             print(f"    {i+1}. refusal={r:.4f}, kl={k:.4f}")
 
+        # Get ACE reference points from scorer (if available)
+        v_minus = getattr(self.scorer, '_v_minus', None)
+        v_plus = getattr(self.scorer, '_v_plus', None)
+
         return ParetoDiscoveryResults(
             pareto_vectors=pareto_vectors,
             pareto_scores=pareto_scores,
@@ -686,7 +1086,9 @@ class ParetoGeometryDiscovery:
             dominated_scores=dominated_scores,
             hypervolume=hv,
             gps=self.gps,
-            n_measurements=len(self.V_observed)
+            n_measurements=len(self.V_observed),
+            v_minus=v_minus,
+            v_plus=v_plus
         )
 
     def get_vector_for_tradeoff(self, refusal_weight: float = 0.5) -> torch.Tensor:
@@ -732,7 +1134,9 @@ def discover_pareto_boundary(
     n_layers: int,
     hidden_dim: int,
     v_init: Optional[torch.Tensor] = None,
-    config: Optional[ParetoDiscoveryConfig] = None
+    config: Optional[ParetoDiscoveryConfig] = None,
+    harmful_completions: Optional[List[str]] = None,
+    n_score_tokens: int = 1
 ) -> ParetoDiscoveryResults:
     """
     Discover Pareto frontier of refusal vectors.
@@ -747,6 +1151,12 @@ def discover_pareto_boundary(
         hidden_dim: Hidden dimension
         v_init: Initial vector (optional)
         config: Discovery configuration
+        harmful_completions: Optional harmful completions to compute loss on.
+            If provided, loss is computed on completion tokens instead of
+            just the next-token refusal logits.
+        n_score_tokens: Number of completion tokens to compute loss on.
+            Only used when harmful_completions is provided. Set to -1 to
+            use all completion tokens. Default: 1
 
     Returns:
         ParetoDiscoveryResults with Pareto-optimal vectors
@@ -756,7 +1166,9 @@ def discover_pareto_boundary(
         tokenizer=tokenizer,
         harmful_prompts=harmful_prompts,
         harmless_prompts=harmless_prompts,
-        refusal_toks=refusal_toks
+        refusal_toks=refusal_toks,
+        harmful_completions=harmful_completions,
+        n_score_tokens=n_score_tokens
     )
 
     discovery = ParetoGeometryDiscovery(

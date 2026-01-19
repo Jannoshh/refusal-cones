@@ -21,18 +21,24 @@ This codebase enables you to:
 4. **Scale Efficiently** - Use PEFT adapters instead of custom implementations (97% less code)
 
 ### Latest updates
-- **Structured GP (default)**: New `gp_type='structured'` models layer dependencies with smoothness + ARD. Automatically learns which layers matter for refusal.
-- **Sane defaults**: Reduced `n_candidates` (1000→100), `n_iterations` (100→30) to prevent OOM. Memory warning printed before discovery.
-- Gradient/adaptive discovery support three GP types: `'structured'` (recommended), `'sparse'`, `'simple'`.
-- New fast CPU tests cover discovery, sparse GP, and loss alignment; run with `uv run pytest -q`. No GPU required.
+- **ACE (Affine Concept Editing)**: Implements the affine refusal model from Marshall et al. (2024) - see Key Concepts section below
+- **Three discovery algorithms**: Mode discovery, boundary discovery, and Pareto discovery (see below)
+- **Modal integration**: Run GPU workloads on Modal cloud with `uv run modal run modal_app.py`
+- **Structured GP (default)**: New `gp_type='structured'` models layer dependencies with smoothness + ARD
+- **Fast scoring**: Pareto discovery uses forward passes only — no generation needed (~0.3s vs ~5s per measurement)
+- New fast CPU tests; run with `uv run pytest -q`. No GPU required.
 
-### Key Innovation: Gradient-Based Adaptive Discovery
+### Discovery Algorithms
 
-Instead of assuming refusal is a simple cone (linear subspace), we:
-- Discover the actual geometry using Gaussian Processes + gradients
-- Use your existing refusal vector as a strong prior
-- Leverage local smoothness (nearby directions work well)
-- **10× more efficient** than pure black-box optimization
+We provide **three** discovery approaches for different use cases:
+
+| Algorithm | What it finds | Use case |
+|-----------|--------------|----------|
+| **Mode Discovery** | Local maxima of R(v) | Find best ablation directions |
+| **Boundary Discovery** | Level set where R(v) ≈ threshold | Map the refusal region boundary |
+| **Pareto Discovery** | Pareto frontier of (refusal, KL) | Optimal ablation/capability tradeoffs |
+
+**Pareto Discovery** (recommended) finds vectors that optimally trade off refusal ablation vs. behavior preservation — no generation needed, just forward passes.
 
 ## Quick Start
 
@@ -351,6 +357,130 @@ print(f"Compliance rate: {compliance_rate:.1%}")
 # Goal: High compliance (model jailbroken successfully)
 ```
 
+## Modal (Cloud GPU)
+
+Run GPU workloads on Modal for scalable discovery and evaluation.
+
+### Setup
+
+```bash
+# Install modal
+uv pip install "modal>=0.64"
+
+# Authenticate (one-time, opens browser)
+uv run modal token new
+```
+
+### Usage
+
+```bash
+# Run Pareto discovery (recommended)
+uv run modal run modal_app.py
+
+# Or run specific functions
+uv run modal run modal_app.py::run_pareto_discovery --n_init_samples 30 --n_pareto_iterations 70
+uv run modal run modal_app.py::run_discovery  # Mode discovery
+uv run modal run modal_app.py::run_evaluation --prompts '["How to hack?"]'
+```
+
+### Viewing Logs
+
+All print statements are captured. View logs at:
+- https://modal.com/apps (select 'refusal-cones' app)
+- Or the URL printed when running: `View run at https://modal.com/apps/...`
+
+### GPU Pricing (Per-Second Billing)
+
+| GPU | Per Second | Per Hour | 5-min job |
+|-----|-----------|----------|-----------|
+| T4 | $0.000164 | ~$0.59 | $0.05 |
+| L4 | $0.000222 | ~$0.80 | $0.07 |
+| **A10G** | **$0.000306** | **~$1.10** | **$0.09** |
+| L40S | $0.000542 | ~$1.95 | $0.16 |
+| A100 40GB | $0.000583 | ~$2.10 | $0.17 |
+| A100 80GB | $0.000694 | ~$2.50 | $0.21 |
+| H100 | $0.001097 | ~$3.95 | $0.33 |
+
+Plus CPU/memory: ~$0.05/hr for 1 core + 8GB.
+
+**Recommendation:** Use **A10G** (default) — good speed/cost balance. T4 is cheaper but slower, often not worth the time savings.
+
+### Free Tier
+
+Starter plan (free): **$30/month credits** — enough for:
+- ~50 ten-minute A10G jobs
+- ~90 ten-minute A100 jobs
+
+### Pareto Discovery Workflow
+
+The recommended workflow for finding optimal refusal vectors:
+
+```bash
+# 1. Run Pareto discovery (finds tradeoff between ablation and capability retention)
+uv run modal run modal_app.py
+
+# 2. Download results from Modal volume
+uv run modal volume get refusal-cones-results pareto_plot_TIMESTAMP.png ./pareto_plot.png
+uv run modal volume get refusal-cones-results pareto_vectors_TIMESTAMP.pt ./pareto_vectors.pt
+uv run modal volume get refusal-cones-results pareto_discovery_TIMESTAMP.json ./results.json
+
+# 3. List all files in volume
+uv run modal volume ls refusal-cones-results
+```
+
+### How Pareto Scoring Works
+
+The `MultiObjectiveScorer` computes two objectives using **forward passes only** (no generation):
+
+1. **refusal_score**: Log-odds of refusal tokens at next position after harmful prompts
+   - Lower (more negative) = better ablation (e.g., -14 is good)
+
+2. **kl_score**: KL divergence between baseline and ablated logits on harmless prompts
+   - Lower = less capability damage (e.g., 0.2 is good)
+
+**Token count:** Scores **1 token per prompt** (the next-token position). With 10 harmful + 10 harmless prompts = 20 logit computations per measurement.
+
+**Speed:** ~0.3s per measurement (no generation needed).
+
+### Output Files
+
+Each run produces:
+- `pareto_discovery_TIMESTAMP.json` — Scores and config
+- `pareto_vectors_TIMESTAMP.pt` — Pareto-optimal vectors as PyTorch tensor
+- `pareto_plot_TIMESTAMP.png` — 3-panel visualization:
+  - **Objective space**: Pareto frontier (refusal vs KL tradeoff)
+  - **t-SNE**: Vector space projection colored by refusal score
+  - **PCA**: Vector space projection colored by KL score
+
+### Example Results
+
+Typical Pareto frontier for Qwen3-0.6B (100 measurements, ~3 min on A10G):
+
+| Vector | Refusal Score | KL Score | Use Case |
+|--------|--------------|----------|----------|
+| Aggressive | -14.2 | 0.53 | Max ablation, some capability loss |
+| Balanced | -12.4 | 0.28 | Good tradeoff |
+| Conservative | -11.7 | 0.16 | Minimal capability damage |
+
+**Hypervolume (HV):** Quality metric for Pareto frontier. Higher = better tradeoffs discovered. Typical: HV ≈ 130-145.
+
+### Scaling Up
+
+To get more accurate landscape estimates:
+
+```python
+# In modal_app.py, increase these:
+config = ParetoDiscoveryConfig(
+    n_init_samples=50,        # More initial exploration
+    n_pareto_iterations=100,  # More refinement
+    max_measurements=200,     # Total budget
+)
+
+# Add more prompts for better score estimates:
+harmful_prompts = [...]  # 20+ prompts recommended
+harmless_prompts = [...]  # 20+ prompts recommended
+```
+
 ## Repository Structure
 
 See **[STRUCTURE.md](STRUCTURE.md)** for detailed directory layout and navigation guide.
@@ -453,7 +583,52 @@ v = v / ||v||                       # Retract to sphere
 
 **Why this matters:** 10× fewer measurements to find local maxima!
 
-### 5. GP Types and Layer Structure
+### 5. Affine Concept Editing (ACE)
+
+Based on ["Refusal in LLMs is an Affine Function"](affine_refusal.pdf) (Marshall et al., 2024), we implement the ACE formula for ablation:
+
+```
+h' = h - proj_v(h) + proj_v(v⁻) + α*v
+```
+
+Where:
+- `v` = the ablation direction (what we optimize)
+- `v⁻` = reference point (mean harmless activations)
+- `v⁺` = mean harmful activations
+- `r = v⁺ - v⁻` = the mean-diff refusal direction
+- `α` = steering parameter (0 = ablate refusal, 1 = induce refusal)
+- `proj_v(x) = (x·v̂)v̂` where `v̂ = v/||v||`
+
+**Key insight**: The bias term `proj_v(v⁻)` keeps activations in a sensible region of activation space. Without it, simple directional ablation can push activations into nonsensical regions.
+
+**Data structures:**
+
+```python
+@dataclass
+class AffineRefusalVector:
+    """Complete affine refusal vector for ACE."""
+    v: torch.Tensor       # [n_layers, hidden_dim] - ablation direction
+    v_minus: torch.Tensor # [n_layers, hidden_dim] - reference point (mean harmless)
+    v_plus: Optional[torch.Tensor] = None  # mean harmful (for analysis)
+```
+
+**In Pareto discovery:**
+- `v_minus` and `v_plus` are computed once from mean activations
+- Every sampled vector `v` uses the same reference points
+- Results include `get_pareto_affine_vectors()` to get full ACE vectors
+
+```python
+# Get Pareto vectors with ACE reference points
+results = discovery.discover()
+affine_vectors = results.get_pareto_affine_vectors()
+
+# Each has (v, v_minus, v_plus) for proper ACE ablation
+for av in affine_vectors:
+    print(f"Direction norm: {av.v.norm():.4f}")
+    print(f"Reference norm: {av.v_minus.norm():.4f}")
+```
+
+### 6. GP Types and Layer Structure
 
 The discovery searches over `[n_layers, hidden_dim]` matrices - a different direction per layer. Three GP types handle this high-dimensional space differently:
 
