@@ -1,11 +1,9 @@
 import json
-import wandb
 import torch
 import functools
 import math
 import matplotlib.pyplot as plt
 import os
-import wandb
 
 from typing import List, Optional
 from jaxtyping import Float, Int
@@ -132,7 +130,6 @@ def plot_density_plot(
     
     # Save plot
     plt.savefig(f"{artifact_dir}/{artifact_name}.png")
-    wandb.save(f"{artifact_dir}/{artifact_name}.png")
     plt.close()
 
 # returns True if the direction should be filtered out
@@ -460,13 +457,11 @@ def select_direction_directopt(
 
     with open(f"{artifact_dir}/direction_evaluations.json", 'w') as f:
         json.dump(json_output_all_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/direction_evaluations.json")
 
     json_output_filtered_scores = sorted(json_output_filtered_scores, key=lambda x: x['refusal_score'], reverse=False)
 
     with open(f"{artifact_dir}/direction_evaluations_filtered.json", 'w') as f:
         json.dump(json_output_filtered_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/direction_evaluations_filtered.json")
 
     assert len(filtered_scores) > 0, "All scores have been filtered out!"
 
@@ -480,12 +475,6 @@ def select_direction_directopt(
     print(f"Refusal score: {ablation_refusal_scores[candidate_idx]:.4f} (baseline: {baseline_refusal_scores_harmful.mean().item():.4f})")
     print(f"Steering score: {steering_refusal_scores[candidate_idx]:.4f} (baseline: {baseline_refusal_scores_harmless.mean().item():.4f})")
     print(f"KL Divergence: {ablation_kl_div_scores[candidate_idx]:.4f}")
-
-    if wandb.run is not None:
-        wandb.summary["val/candidate_idx"] = candidate_idx
-        wandb.summary["val/refusal_score"] = ablation_refusal_scores[candidate_idx].item()
-        wandb.summary["val/steering_score"] = steering_refusal_scores[candidate_idx].item()
-        wandb.summary["val/kl_div_score"] = ablation_kl_div_scores[candidate_idx].item()
 
     return candidate_idx, candidate_directions[candidate_idx]
 
@@ -517,6 +506,8 @@ def select_subspace_direction_directopt2(
     induce_refusal_threshold=0.0, # directions with a lower inducing refusal score are filtered out
     batch_size=32,
     n_samples=8,
+    sampling_method="hypersphere",  # "interpolation" or "hypersphere"
+    alpha=1.0,
 ):
     if not os.path.exists(artifact_dir):
         os.makedirs(artifact_dir)
@@ -542,7 +533,7 @@ def select_subspace_direction_directopt2(
         batch_size=batch_size
     )
 
-    if wandb.config["sampling_method"] == "interpolation":
+    if sampling_method == "interpolation":
         samples = sample_prob_vectors(n_samples, subspace_dim).to(model_base.model.device)
     else:
         samples = sample_hypersphere_vectors(n_samples, subspace_dim).to(model_base.model.device)
@@ -598,7 +589,7 @@ def select_subspace_direction_directopt2(
         norm_best_direction = direction / direction.norm(dim=-1, keepdim=True)
         transformed_samples = [torch.matmul(sample, norm_best_direction) for sample in samples]
         transformed_samples = [sample / torch.norm(sample) for sample in transformed_samples]
-        transformed_samples = [sample * wandb.config["alpha"] for sample in transformed_samples]
+        transformed_samples = [sample * alpha for sample in transformed_samples]
         transformed_samples = [sample.to(model_base.model.dtype) for sample in transformed_samples]
 
         for sample_idx in tqdm(range(n_samples), desc=f"Computing KL divergence for sample directions for candidate {candidate_idx}"):
@@ -760,13 +751,11 @@ def select_subspace_direction_directopt2(
 
     with open(f"{artifact_dir}/direction_evaluations.json", 'w') as f:
         json.dump(json_output_all_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/direction_evaluations.json")
 
     json_output_filtered_scores = sorted(json_output_filtered_scores, key=lambda x: x['mean_refusal_score'], reverse=False)
 
     with open(f"{artifact_dir}/direction_evaluations_filtered.json", 'w') as f:
         json.dump(json_output_filtered_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/direction_evaluations_filtered.json")
 
     assert len(filtered_scores) > 0, "All scores have been filtered out!"
 
@@ -791,12 +780,8 @@ def select_subspace_direction_directopt2(
     samples = sample_hypersphere_vectors(512, subspace_dim).to(model_base.model.device)
     transformed_samples = [torch.matmul(sample, norm_best_direction) for sample in samples]
     transformed_samples = [sample / torch.norm(sample) for sample in transformed_samples]
-    transformed_samples = [sample * wandb.config["alpha"] for sample in transformed_samples]
+    transformed_samples = [sample * alpha for sample in transformed_samples]
 
-    if wandb.run is not None:
-        wandb.summary["candidate_idx"] = candidate_idx
-        torch.save(transformed_samples, f'{wandb.run.dir}/samples.pt')
-        wandb.save(f'samples.pt')
     return candidate_idx, candidate_directions[candidate_idx, :]
 
 def select_subspace_direction_directopt(
@@ -809,6 +794,7 @@ def select_subspace_direction_directopt(
     kl_threshold=0.1, # directions larger KL score are filtered out
     induce_refusal_threshold=0.0, # directions with a lower inducing refusal score are filtered out
     batch_size=32,
+    alpha=1.0,
 ):
     if not os.path.exists(artifact_dir):
         os.makedirs(artifact_dir)
@@ -947,13 +933,11 @@ def select_subspace_direction_directopt(
 
     with open(f"{artifact_dir}/direction_evaluations.json", 'w') as f:
         json.dump(json_output_all_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/direction_evaluations.json")
 
     json_output_filtered_scores = sorted(json_output_filtered_scores, key=lambda x: x['max_refusal_score'], reverse=False)
 
     with open(f"{artifact_dir}/direction_evaluations_filtered.json", 'w') as f:
         json.dump(json_output_filtered_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/direction_evaluations_filtered.json")
 
     assert len(filtered_scores) > 0, "All scores have been filtered out!"
 
@@ -969,7 +953,7 @@ def select_subspace_direction_directopt(
     samples = sample_prob_vectors(n_samples, subspace_dim).to(model_base.model.device).to(best_direction.dtype)
     transformed_samples = [torch.matmul(sample, norm_best_direction) for sample in samples]
     transformed_samples = [sample / torch.norm(sample) for sample in transformed_samples]
-    transformed_samples = [sample * wandb.config["alpha"] for sample in transformed_samples]
+    transformed_samples = [sample * alpha for sample in transformed_samples]
 
     sample_ablation_kl_div_scores = torch.zeros((n_samples), device=model_base.model.device, dtype=torch.float64)
     sample_ablation_refusal_scores = torch.zeros((n_samples), device=model_base.model.device, dtype=torch.float64)
@@ -1064,13 +1048,11 @@ def select_subspace_direction_directopt(
 
     with open(f"{artifact_dir}/sample_direction_evaluations.json", 'w') as f:
         json.dump(json_output_all_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/sample_direction_evaluations.json")
 
     json_output_filtered_scores = sorted(json_output_filtered_scores, key=lambda x: x['max_refusal_score'], reverse=False)
 
     with open(f"{artifact_dir}/sample_direction_evaluations_filtered.json", 'w') as f:
         json.dump(json_output_filtered_scores, f, indent=4)
-    wandb.save(f"{artifact_dir}/sample_direction_evaluations_filtered.json")
 
     assert len(sample_filtered_scores) > 0, "All scores have been filtered out!"
 
@@ -1110,11 +1092,7 @@ def select_subspace_direction_directopt(
     print(f"Min sample KL Divergence score: {sample_ablation_kl_div_scores.min().item():.4f}")
     print(f"Max sample KL Divergence score: {sample_ablation_kl_div_scores.max().item():.4f}")
 
-    if wandb.run is not None:
-        wandb.summary["candidate_idx"] = candidate_idx
-    return sample_idx, transformed_samples[sample_idx] # TODO
-    
-    return candidate_idx, candidate_directions[candidate_idx, :]
+    return sample_idx, transformed_samples[sample_idx]
 
 def masked_mean(seq, mask = None, dim = 1, keepdim = False):
     if mask is None:

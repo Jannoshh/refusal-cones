@@ -3,7 +3,6 @@ import json
 import os
 import gc
 import numpy as np
-import wandb
 from strong_reject.evaluate import evaluate_dataset
 from datasets import Dataset
 
@@ -285,15 +284,6 @@ def evaluate_jailbreak(
         evaluation["xstest_judgements"] = np.mean(scores)
 
         print(f"Average XSTest ASR: {evaluation['xstest_judgements']}")
-
-    if wandb.run is not None:
-        for key, value in evaluation.items():
-            if "per_category" in key:
-                continue
-            description = os.path.basename(evaluation_path)
-            description = description.replace("_evaluations.json", "")
-            print(description, key)
-            wandb.summary[f"{description}_{key}"] = value
 
     evaluation["completions"] = completions
 
