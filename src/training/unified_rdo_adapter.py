@@ -45,6 +45,10 @@ class UnifiedRDOConfig(ProjectionConfig):
     enable_rank_k: bool = False
     rank_k: int = 1  # Number of vectors in subspace
 
+    # Affine reference point (baseline)
+    use_baseline: bool = False  # Use baseline from harmless prompts
+    train_magnitudes: bool = False  # Train magnitudes or compute from data
+
     # Loss weights
     lambda_harmful: float = 1.0    # Weight for harmful examples
     lambda_harmless: float = 0.5   # Weight for harmless examples
@@ -52,18 +56,22 @@ class UnifiedRDOConfig(ProjectionConfig):
 
 class UnifiedRDOLayer(nn.Module):
     """
-    Unified affine transformation layer.
+    Unified affine transformation layer with baseline support.
 
-    Implements: h' = (I - β·vv^T)h + α·v
+    Two modes:
+
+    1. Standard (use_baseline=False):
+       h' = (I - β·vv^T)h + α·v
+
+    2. Affine with baseline (use_baseline=True):
+       h' = h - β·((h - h0)·v_norm)·v_norm + α·steering_mag·v_norm
 
     Where:
-        β = projection_alpha (controls strength of ablation)
-        α = addition_alpha (controls strength of addition)
+        h0 = baseline (mean activation on harmless prompts)
+        v_norm = normalized direction (only trainable param)
+        steering_mag = magnitude (auto-computed from data)
 
-    Special cases:
-        - β=1, α=0: Pure projection (ablation)
-        - β=0, α=1: Pure addition
-        - β=1, α=1: Full affine (recommended)
+    This is the true affine formulation from the paper.
     """
 
     def __init__(
@@ -72,7 +80,9 @@ class UnifiedRDOLayer(nn.Module):
         dim: int,
         projection_alpha: float = 1.0,
         addition_alpha: float = 1.0,
-        normalize: bool = True
+        normalize: bool = True,
+        use_baseline: bool = False,
+        train_magnitudes: bool = False
     ):
         super().__init__()
 
@@ -80,19 +90,32 @@ class UnifiedRDOLayer(nn.Module):
         self.projection_alpha = projection_alpha
         self.addition_alpha = addition_alpha
         self.normalize = normalize
+        self.use_baseline = use_baseline
+        self.train_magnitudes = train_magnitudes
 
         # Freeze base layer
         for param in base_layer.parameters():
             param.requires_grad = False
 
-        # Trainable steering vector
+        # Trainable steering vector (normalized direction)
         self.vector = nn.Parameter(torch.randn(dim) * 0.01)
+
+        # Baseline and magnitudes (non-trainable by default, computed from data)
+        self.register_buffer('baseline', torch.zeros(dim))
+        self.register_buffer('baseline_component', torch.tensor(0.0))
+        self.register_buffer('steering_magnitude', torch.tensor(1.0))
+
+        # Optionally make magnitudes trainable
+        if train_magnitudes:
+            self.baseline_component = nn.Parameter(self.baseline_component)
+            self.steering_magnitude = nn.Parameter(self.steering_magnitude)
 
     def forward(self, x, *args, **kwargs):
         """
         Forward with unified affine transformation.
 
-        Computes: h' = (I - β·vv^T)h + α·v
+        Standard mode: h' = (I - β·vv^T)h + α·v
+        Baseline mode: h' = h - β·((h - h0)·v)v + α·mag·v
         """
         # Base layer forward
         result = self.base_layer(x, *args, **kwargs)
@@ -110,21 +133,82 @@ class UnifiedRDOLayer(nn.Module):
         if self.normalize:
             v = v / (v.norm() + 1e-8)
 
-        # Apply unified affine transformation
-        # h' = h - β·(h·v)v + α·v
-        #    = h + [α·v - β·(h·v)v]
+        if self.use_baseline:
+            # Affine mode with baseline reference point
+            # h' = h - β·((h - h0)·v)v + α·mag·v
 
-        # Projection component: β·(h·v)v
-        projection_magnitude = torch.einsum('...d,d->...', activations, v)
-        projection = torch.einsum('...,d->...d', projection_magnitude, v)
+            # Subtract baseline (center relative to harmless mean)
+            h_centered = activations - self.baseline
 
-        # Affine transformation
-        modified = activations - self.projection_alpha * projection + self.addition_alpha * v
+            # Project out centered component
+            projection_magnitude = torch.einsum('...d,d->...', h_centered, v)
+            projection = torch.einsum('...,d->...d', projection_magnitude, v)
+
+            # Add back steering with learned magnitude
+            modified = (activations - self.projection_alpha * projection +
+                       self.addition_alpha * self.steering_magnitude * v)
+        else:
+            # Standard mode (no baseline)
+            # h' = h - β·(h·v)v + α·v
+
+            # Projection component: β·(h·v)v
+            projection_magnitude = torch.einsum('...d,d->...', activations, v)
+            projection = torch.einsum('...,d->...d', projection_magnitude, v)
+
+            # Affine transformation
+            modified = activations - self.projection_alpha * projection + self.addition_alpha * v
 
         # Reconstruct output
         if extra_outputs is not None:
             return (modified,) + extra_outputs
         return modified
+
+    def fit_baseline_and_magnitude(
+        self,
+        harmless_activations: torch.Tensor,
+        harmful_activations: torch.Tensor
+    ):
+        """
+        Fit baseline and steering magnitude from data.
+
+        This computes:
+        1. baseline (h0) = mean activation on harmless prompts
+        2. steering_magnitude = mean(h_harmful · v) - mean(h_harmless · v)
+
+        Args:
+            harmless_activations: Activations on harmless prompts [n_harmless, dim]
+            harmful_activations: Activations on harmful prompts [n_harmful, dim]
+
+        Usage:
+            # After initializing layer
+            layer.fit_baseline_and_magnitude(harmless_acts, harmful_acts)
+            # Now baseline and steering_magnitude are set automatically!
+        """
+        # Get normalized direction
+        v = self.vector.detach()
+        if self.normalize:
+            v = v / (v.norm() + 1e-8)
+
+        # Compute baseline (mean harmless activation)
+        baseline = harmless_activations.mean(dim=0)
+        self.baseline.copy_(baseline)
+
+        # Compute mean dot products
+        harmless_dots = (harmless_activations @ v).mean()
+        harmful_dots = (harmful_activations @ v).mean()
+
+        # Steering magnitude = difference in mean projections
+        steering_mag = harmful_dots - harmless_dots
+        self.steering_magnitude.copy_(steering_mag)
+
+        # Baseline component (for reference, usually close to 0 if centered)
+        baseline_comp = ((harmless_activations - baseline) @ v).mean()
+        self.baseline_component.copy_(baseline_comp)
+
+        print(f"  Fitted affine parameters:")
+        print(f"    Baseline norm: {baseline.norm().item():.4f}")
+        print(f"    Baseline component: {baseline_comp.item():.4f}")
+        print(f"    Steering magnitude: {steering_mag.item():.4f}")
 
     def get_projection_matrix(self) -> torch.Tensor:
         """
@@ -348,7 +432,9 @@ class UnifiedRDOModel(nn.Module):
                     dim=dim,
                     projection_alpha=self.config.projection_alpha,
                     addition_alpha=self.config.addition_alpha,
-                    normalize=self.config.normalize_vectors
+                    normalize=self.config.normalize_vectors,
+                    use_baseline=self.config.use_baseline,
+                    train_magnitudes=self.config.train_magnitudes
                 )
             layers[idx] = wrapped
 
@@ -391,6 +477,120 @@ class UnifiedRDOModel(nn.Module):
             f"all params: {all_params:,} || "
             f"trainable%: {100 * trainable_params / all_params:.4f}"
         )
+
+    def fit_all_baselines(
+        self,
+        tokenizer,
+        harmless_prompts: List[str],
+        harmful_prompts: List[str],
+        batch_size: int = 8
+    ):
+        """
+        Fit baseline and steering magnitudes for all layers from data.
+
+        This automatically computes:
+        1. baseline (h0) = mean activation on harmless prompts per layer
+        2. steering_magnitude = mean(h_harmful · v) - mean(h_harmless · v) per layer
+
+        After calling this, you only need to train the direction vectors!
+
+        Args:
+            tokenizer: Tokenizer
+            harmless_prompts: List of harmless prompts
+            harmful_prompts: List of harmful prompts
+            batch_size: Batch size for activation collection
+
+        Usage:
+            model = get_unified_rdo_model(base_model, config)
+            model.fit_all_baselines(tokenizer, harmless_prompts, harmful_prompts)
+            # Now train only the direction vectors!
+        """
+        print("=" * 70)
+        print("Fitting Baselines and Magnitudes from Data")
+        print("=" * 70)
+
+        # Collect activations per layer
+        from collections import defaultdict
+        harmless_acts = defaultdict(list)
+        harmful_acts = defaultdict(list)
+
+        # Register hooks to capture activations
+        handles = []
+        layer_idx = 0
+
+        if hasattr(self.base_model, 'model'):
+            layers = self.base_model.model.layers
+        elif hasattr(self.base_model, 'transformer'):
+            layers = self.base_model.transformer.h
+        else:
+            raise ValueError("Unsupported model architecture")
+
+        def get_hook(layer_id):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    act = output[0][:, -1, :].detach()  # Last token
+                else:
+                    act = output[:, -1, :].detach()
+                if layer_id in harmless_acts:  # Currently collecting harmless
+                    harmless_acts[layer_id].append(act.cpu())
+                else:  # Currently collecting harmful
+                    harmful_acts[layer_id].append(act.cpu())
+            return hook
+
+        for idx, layer in enumerate(layers):
+            if isinstance(layer, UnifiedRDOLayer):
+                handle = layer.base_layer.register_forward_hook(get_hook(idx))
+                handles.append(handle)
+                layer_idx += 1
+
+        # Collect harmless activations
+        print(f"\n1. Collecting activations on {len(harmless_prompts)} harmless prompts...")
+        self.base_model.eval()
+        with torch.no_grad():
+            for i in range(0, len(harmless_prompts), batch_size):
+                batch = harmless_prompts[i:i+batch_size]
+                inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+                inputs = {k: v.to(self.base_model.device) for k, v in inputs.items()}
+                _ = self.base_model(**inputs)
+
+        # Clear for harmful
+        for idx in list(harmless_acts.keys()):
+            harmful_acts[idx] = []
+
+        # Collect harmful activations
+        print(f"2. Collecting activations on {len(harmful_prompts)} harmful prompts...")
+        with torch.no_grad():
+            for i in range(0, len(harmful_prompts), batch_size):
+                batch = harmful_prompts[i:i+batch_size]
+                inputs = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+                inputs = {k: v.to(self.base_model.device) for k, v in inputs.items()}
+                _ = self.base_model(**inputs)
+
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+
+        # Fit each layer
+        print(f"\n3. Fitting {len(harmless_acts)} layers...")
+        layer_idx = 0
+        for idx, layer in enumerate(layers):
+            if isinstance(layer, UnifiedRDOLayer) and idx in harmless_acts:
+                print(f"\nLayer {layer_idx}:")
+
+                # Stack activations
+                harmless_tensor = torch.cat(harmless_acts[idx], dim=0)
+                harmful_tensor = torch.cat(harmful_acts[idx], dim=0)
+
+                # Fit baseline and magnitude
+                layer.fit_baseline_and_magnitude(harmless_tensor, harmful_tensor)
+
+                layer_idx += 1
+
+        print("\n" + "=" * 70)
+        print("✓ Baselines and magnitudes fitted!")
+        print("=" * 70)
+        print("\nNow you only need to train the direction vectors.")
+        print("The magnitudes are fixed from data (unless train_magnitudes=True).")
 
     def save_pretrained(self, save_directory: str):
         """Save unified RDO adapters."""
