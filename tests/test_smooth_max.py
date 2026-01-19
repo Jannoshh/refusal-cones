@@ -12,7 +12,7 @@ Verifies that:
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from src.training.per_layer_training import smooth_max_loss, weighted_smooth_max_loss
+from src.training.trainers.per_layer_training import smooth_max_loss, weighted_smooth_max_loss
 
 
 def test_smooth_max_properties():

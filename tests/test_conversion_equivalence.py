@@ -371,7 +371,7 @@ def test_backward_compatibility():
     print("=" * 70)
 
     from src.utils.conversion_utils import convert_model_to_vector_modified
-    from src.training.per_layer_training import PerLayerRefusalVectors
+    from src.training.trainers.per_layer_training import PerLayerRefusalVectors
 
     # Create model
     torch.manual_seed(42)

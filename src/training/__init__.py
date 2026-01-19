@@ -1,82 +1,66 @@
-"""Training modules for refusal vectors."""
+"""Training modules for refusal vectors.
 
-from .rdo_peft_adapter import RDOConfig, get_rdo_model
-from .rdo_peft_trainer import train_rdo_with_peft, RDOTrainer
-from .projection_adapter import ProjectionConfig, ProjectionLayer, get_projection_model
-from .per_layer_training import (
-    PerLayerRefusalVectors,
-    train_per_layer_vectors,
-    smooth_max_loss,
-    weighted_smooth_max_loss
-)
-from .sft_peft_trainer import train_sft_with_peft
+Organized into:
+- adapters/: Adapter implementations (unified_rdo_adapter.py)
+- trainers/: Trainer implementations (UnifiedRDOTrainer, RL trainers)
 
-# Unified Affine RDO modules
-from .unified_rdo_adapter import (
+Implements ACE (Affine Concept Editing) from "Refusal in LLMs is an Affine Function".
+"""
+
+# Re-export from adapters
+from .adapters import (
+    ProjectionConfig,
     UnifiedRDOConfig,
     UnifiedRDOLayer,
     RankKUnifiedLayer,
     UnifiedRDOModel,
-    get_unified_rdo_model
+    get_unified_rdo_model,
 )
-from .unified_rdo_trainer import (
+
+# Re-export from trainers
+from .trainers import (
+    # Unified RDO trainer (ACE-based)
     UnifiedRDOTrainer,
     prepare_unified_dataset,
-    train_unified_rdo
+    train_unified_rdo,
+    # Per-layer training
+    PerLayerRefusalVectors,
+    train_per_layer_vectors,
+    smooth_max_loss,
+    weighted_smooth_max_loss,
+    compute_ce_loss,
+    projection_einops,
+    apply_per_layer_ablation,
+    # RL trainers
+    VectorPolicyGradient,
+    PPOVectorOptimizer,
+    GRPOAdversarialTrainer,
+    HarmfulnessRewardModel,
+    VectorGRPOTrainer,
 )
-# These modules have external dependencies that may not be available
-try:
-    from .unified_rdo_eval import (
-        UnifiedRDOEvaluator,
-        EvaluationResults,
-        evaluate_unified_rdo
-    )
-except ImportError:
-    UnifiedRDOEvaluator = None
-    EvaluationResults = None
-    evaluate_unified_rdo = None
-
-try:
-    from .refusal_token_eval import (
-        RefusalTokenEvaluator,
-        RefusalTokenResults,
-        evaluate_with_refusal_tokens,
-        get_refusal_tokens
-    )
-except ImportError:
-    RefusalTokenEvaluator = None
-    RefusalTokenResults = None
-    evaluate_with_refusal_tokens = None
-    get_refusal_tokens = None
 
 __all__ = [
-    # Standard RDO
-    'RDOConfig',
-    'get_rdo_model',
-    'train_rdo_with_peft',
-    'RDOTrainer',
+    # Adapters
     'ProjectionConfig',
-    'ProjectionLayer',
-    'get_projection_model',
-    'PerLayerRefusalVectors',
-    'train_per_layer_vectors',
-    'smooth_max_loss',
-    'weighted_smooth_max_loss',
-    'train_sft_with_peft',
-    # Unified Affine RDO
     'UnifiedRDOConfig',
     'UnifiedRDOLayer',
     'RankKUnifiedLayer',
     'UnifiedRDOModel',
     'get_unified_rdo_model',
+    # Trainers
     'UnifiedRDOTrainer',
     'prepare_unified_dataset',
     'train_unified_rdo',
-    'UnifiedRDOEvaluator',
-    'EvaluationResults',
-    'evaluate_unified_rdo',
-    'RefusalTokenEvaluator',
-    'RefusalTokenResults',
-    'evaluate_with_refusal_tokens',
-    'get_refusal_tokens'
+    'PerLayerRefusalVectors',
+    'train_per_layer_vectors',
+    'smooth_max_loss',
+    'weighted_smooth_max_loss',
+    'compute_ce_loss',
+    'projection_einops',
+    'apply_per_layer_ablation',
+    'VectorPolicyGradient',
+    'PPOVectorOptimizer',
+    'GRPOAdversarialTrainer',
+    'HarmfulnessRewardModel',
+    'VectorGRPOTrainer',
 ]

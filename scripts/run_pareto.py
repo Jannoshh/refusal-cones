@@ -6,6 +6,10 @@ Usage:
     uv run python scripts/run_pareto.py
     uv run python scripts/run_pareto.py --high-budget
     uv run python scripts/run_pareto.py --n-init 50 --n-iter 100
+    uv run python scripts/run_pareto.py --n-harmful 64 --n-harmless 64
+
+    # RDO-style multi-token KL (more accurate capability measurement)
+    uv run python scripts/run_pareto.py --generate-completions --n-kl-tokens 30
 """
 
 import argparse
@@ -21,14 +25,28 @@ def run_modal_and_download(args):
 
     # Build modal command
     if args.high_budget:
-        cmd = ["uv", "run", "modal", "run", "modal_app.py::run_high_budget_discovery"]
+        cmd = [
+            "uv", "run", "modal", "run", "modal_app.py::run_high_budget_discovery",
+            "--n-harmful", str(args.n_harmful),
+            "--n-harmless", str(args.n_harmless),
+            "--n-kl-tokens", str(args.n_kl_tokens),
+            "--generation-batch-size", str(args.generation_batch_size),
+        ]
+        if args.generate_completions:
+            cmd.append("--generate-completions")
     else:
         cmd = [
             "uv", "run", "modal", "run", "modal_app.py::run_pareto_discovery",
             "--n-init-samples", str(args.n_init),
             "--n-pareto-iterations", str(args.n_iter),
             "--max-measurements", str(args.max_measurements),
+            "--n-harmful", str(args.n_harmful),
+            "--n-harmless", str(args.n_harmless),
+            "--n-kl-tokens", str(args.n_kl_tokens),
+            "--generation-batch-size", str(args.generation_batch_size),
         ]
+        if args.generate_completions:
+            cmd.append("--generate-completions")
 
     print(f"Running: {' '.join(cmd)}")
     print("=" * 60)
@@ -133,6 +151,16 @@ def main():
                         help="Number of Pareto iterations (default: 70)")
     parser.add_argument("--max-measurements", type=int, default=150,
                         help="Maximum measurements (default: 150)")
+    parser.add_argument("--n-harmful", type=int, default=32,
+                        help="Number of harmful prompts for scoring (default: 32)")
+    parser.add_argument("--n-harmless", type=int, default=32,
+                        help="Number of harmless prompts for scoring (default: 32)")
+    parser.add_argument("--generate-completions", action="store_true",
+                        help="Generate completions for multi-token KL (RDO-style)")
+    parser.add_argument("--n-kl-tokens", type=int, default=1,
+                        help="Number of tokens for KL scoring (default: 1, use 30 for RDO-style)")
+    parser.add_argument("--generation-batch-size", type=int, default=32,
+                        help="Batch size for completion generation (default: 32)")
 
     args = parser.parse_args()
 

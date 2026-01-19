@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import torch
 
-from src.training.per_layer_training import compute_ce_loss
+from src.training.trainers.per_layer_training import compute_ce_loss
 
 
 def test_compute_ce_loss_handles_mismatched_lengths():

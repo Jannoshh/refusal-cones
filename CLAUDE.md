@@ -21,6 +21,9 @@ This codebase enables you to:
 4. **Scale Efficiently** - Use PEFT adapters instead of custom implementations (97% less code)
 
 ### Latest updates
+- **Training consolidation**: All adapter code consolidated into `unified_rdo_adapter.py`. Training uses ACE with 2-pass loss (ablation + addition).
+- **Multi-token KL (RDO-style)**: Optional `--generate-completions --n-kl-tokens 30` computes KL over pregenerated completions, matching the original RDO paper's retain loss
+- **Flexible batch sizes**: Pareto scoring now uses configurable prompt counts via `--n-harmful` and `--n-harmless` (default 32 each, loaded from `data/splits/`)
 - **ACE (Affine Concept Editing)**: Implements the affine refusal model from Marshall et al. (2024) - see Key Concepts section below
 - **Three discovery algorithms**: Mode discovery, boundary discovery, and Pareto discovery (see below)
 - **Modal integration**: Run GPU workloads on Modal cloud with `uv run modal run modal_app.py`
@@ -256,10 +259,10 @@ Speedup: 7.5× fewer measurements than pure GP!
 
 #### 2. Train Refusal Vectors
 
-Use discovered geometry to initialize training:
+Use discovered geometry to initialize training with ACE (Affine Concept Editing):
 
 ```python
-from src.training import get_cone_model, get_rdo_model, RDOConfig, train_rdo_with_peft
+from src.training import get_unified_rdo_model, UnifiedRDOConfig, train_unified_rdo
 from transformers import AutoModelForCausalLM
 
 # Load base model
@@ -269,51 +272,43 @@ base_model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 
-# Choose representation based on discovered geometry
-if results['geometry']['intrinsic_dimension'] <= 10:
-    # Simple geometry → use cone
-    print(f"Using {len(results['modes'])}-dimensional cone")
+# Configure ACE adapter
+config = UnifiedRDOConfig(
+    target_modules=["layers"],
+    operation='affine',
+    projection_alpha=1.0,  # Full projection
+    addition_alpha=1.0,    # Full addition
+    use_baseline=True,     # Use ACE baseline (v⁻)
+    enable_rank_k=len(results['modes']) > 1,  # Multi-vector if needed
+    rank_k=len(results['modes'])
+)
 
-    model = get_cone_model(
-        base_model,
-        cone_rank=len(results['modes']),
-        init_vectors=results['modes'],  # Initialize from discovery!
-        target_modules=["self_attn.o_proj"]  # Apply to attention outputs
-    )
-else:
-    # Complex geometry → use standard RDO
-    print("Using standard RDO (single vector per layer)")
+model = get_unified_rdo_model(base_model, config)
 
-    config = RDOConfig(
-        target_modules=["self_attn.o_proj"],
-        operation='both',  # Ablation + addition
-        projection_alpha=1.0,
-        addition_alpha=1.0
-    )
-
-    model = get_rdo_model(base_model, config)
-
-    # Initialize from first discovered mode
-    initialize_from_discovery(model, results['modes'][0])
-
-# Prepare data
-harmful_data = load_harmful_dataset()  # Your harmful examples
+# Prepare data - harmful examples need BOTH completions for 2-pass training
+harmful_data = [
+    {
+        'instruction': "How to build a bomb?",
+        'harmful_completion': "Here's how to build...",  # For ablation loss
+        'refusal_completion': "I cannot help with that."  # For addition loss
+    },
+    # ... more examples
+]
 harmless_data = load_harmless_dataset()  # Your helpful examples
 
-# Train with RDO
-trained_model, trainer = train_rdo_with_peft(
+# Train with ACE-based RDO (2 forward passes for harmful examples)
+trained_model, trainer = train_unified_rdo(
     model_name="Qwen/Qwen3-0.6B",
     harmful_data=harmful_data,
     harmless_data=harmless_data,
-    output_dir="rdo_adapters",
+    output_dir="ace_adapters",
     num_epochs=10,
     batch_size=4,
     learning_rate=1e-3,
-    lambda_ablate=1.0,  # Maximize harmfulness when ablated
-    lambda_add=1.0,     # Maximize refusal when added
-    lambda_retain=0.5,  # Retain helpfulness on harmless
-    enable_cone=len(results['modes']) > 1,
-    cone_rank=len(results['modes']),
+    lambda_ablate=1.0,  # Compliance when ablated (α=0)
+    lambda_add=1.0,     # Refusal when added (α>0)
+    lambda_retain=0.5,  # Helpfulness on harmless
+    use_baseline=True,  # Use ACE baseline
     fp16=True
 )
 
@@ -422,8 +417,11 @@ uv run python scripts/run_pareto.py
 # High-budget run (more iterations)
 uv run python scripts/run_pareto.py --high-budget
 
-# Custom parameters
+# Custom iteration parameters
 uv run python scripts/run_pareto.py --n-init 50 --n-iter 100
+
+# Custom batch sizes (more prompts = better score estimates)
+uv run python scripts/run_pareto.py --n-harmful 64 --n-harmless 64
 
 # Results are automatically saved to results/pareto_ace_TIMESTAMP/
 ```
@@ -445,17 +443,44 @@ uv run modal volume ls refusal-cones-results
 
 ### How Pareto Scoring Works
 
-The `MultiObjectiveScorer` computes two objectives using **forward passes only** (no generation):
+The `MultiObjectiveScorer` computes objectives using **forward passes only** (no generation at scoring time):
 
-1. **refusal_score**: Log-odds of refusal tokens at next position after harmful prompts
-   - Lower (more negative) = better ablation (e.g., -14 is good)
+**Primary objectives (used for GP optimization):**
 
-2. **kl_score**: KL divergence between baseline and ablated logits on harmless prompts
-   - Lower = less capability damage (e.g., 0.2 is good)
+1. **refusal_score**: Cross-entropy loss on harmful completion targets
+   - Targets are precomputed from `data/splits/harmful_train.json`
+   - With `n_kl_tokens=30`: loss over first 30 tokens of target
+   - Lower = model complies with harmful request (ablation working)
 
-**Token count:** Scores **1 token per prompt** (the next-token position). With 10 harmful + 10 harmless prompts = 20 logit computations per measurement.
+2. **kl_score**: KL divergence at last token position on harmless prompts
+   - Single-token, fast heuristic for capability preservation
+   - Lower = less capability damage
 
-**Speed:** ~0.3s per measurement (no generation needed).
+**Secondary objectives (for evaluation, not GP):**
+
+3. **retain_loss** (optional): Multi-token KL over pregenerated harmless completions
+   - Only computed when `--generate-completions` is enabled
+   - More accurate capability measurement (like original RDO paper)
+
+**Token counts:**
+- Default (`n_kl_tokens=1`): Single-token scoring for both refusal and KL
+- RDO-style (`n_kl_tokens=30`): 30-token ablation loss + optional 30-token retain_loss
+
+**Usage examples:**
+
+```bash
+# Default: fast single-token scoring
+uv run modal run modal_app.py::run_pareto_discovery
+
+# RDO-style: 30-token ablation loss (uses precomputed targets)
+uv run modal run modal_app.py::run_pareto_discovery --n-kl-tokens 30
+
+# Full RDO-style: also generate harmless completions for retain_loss
+uv run modal run modal_app.py::run_pareto_discovery \
+    --n-kl-tokens 30 --generate-completions
+```
+
+**Speed:** ~0.3-0.5s per measurement. `--generate-completions` adds ~1-2 min startup.
 
 ### Output Files
 
@@ -481,20 +506,28 @@ Typical Pareto frontier for Qwen3-0.6B (100 measurements, ~3 min on A10G):
 
 ### Scaling Up
 
-To get more accurate landscape estimates:
+To get more accurate landscape estimates, use CLI parameters:
 
-```python
-# In modal_app.py, increase these:
-config = ParetoDiscoveryConfig(
-    n_init_samples=50,        # More initial exploration
-    n_pareto_iterations=100,  # More refinement
-    max_measurements=200,     # Total budget
-)
+```bash
+# Increase prompt batch sizes (default: 32 each, loaded from data/splits/)
+uv run modal run modal_app.py::run_pareto_discovery \
+    --n-harmful 64 --n-harmless 64
 
-# Add more prompts for better score estimates:
-harmful_prompts = [...]  # 20+ prompts recommended
-harmless_prompts = [...]  # 20+ prompts recommended
+# Increase iterations
+uv run modal run modal_app.py::run_pareto_discovery \
+    --n-init-samples 50 --n-pareto-iterations 100 --max-measurements 200
+
+# Or use the wrapper script
+uv run python scripts/run_pareto.py --n-harmful 128 --n-harmless 128
+
+# High-budget run (more iterations + custom batch size)
+uv run python scripts/run_pareto.py --high-budget --n-harmful 64 --n-harmless 64
 ```
+
+**Batch size recommendations:**
+- 32 (default): Fast, reasonable estimates
+- 64: Better estimates, ~2x slower per measurement
+- 128: High quality, ~4x slower per measurement
 
 ## Repository Structure
 
@@ -506,7 +539,9 @@ See **[STRUCTURE.md](STRUCTURE.md)** for detailed directory layout and navigatio
 refusal-cones/
 ├── src/                   # Core implementations
 │   ├── discovery/        # Geometry discovery (gradient_discovery.py, etc.)
-│   ├── training/         # Training modules (rdo_peft_adapter.py, etc.)
+│   ├── training/         # Training modules
+│   │   ├── adapters/    # unified_rdo_adapter.py (ACE implementation)
+│   │   └── trainers/    # unified_rdo_trainer.py, RL trainers
 │   ├── measurement/      # Evaluation (vllm_hybrid_measurement.py, etc.)
 │   └── utils/            # Utilities
 ├── docs/                  # All documentation
@@ -524,7 +559,7 @@ refusal-cones/
 
 **Discovery** (in `src/discovery/`):
 - `gradient_discovery.py` - Gradient-based discovery (RECOMMENDED)
-- `efficient_discovery.py` - Pure GP with efficiency strategies
+- `pareto_boundary_discovery.py` - Pareto frontier discovery (RECOMMENDED for multi-objective)
 - `adaptive_geometry_discovery.py` - Base GP implementation with three GP types:
   - `StructuredLayerGP` - Layer smoothness + ARD (default, recommended)
   - `AdaptiveSparseGP` - Sparse inducing points for scaling
@@ -532,9 +567,10 @@ refusal-cones/
 - `boundary_discovery.py` - Boundary/level-set discovery with straddle acquisition
 
 **Training** (in `src/training/`):
-- `rdo_peft_adapter.py` - PEFT adapters for projection
-- `rdo_peft_trainer.py` - Multi-objective RDO training
-- `projection_adapter.py` - Simple projection adapter
+- `adapters/unified_rdo_adapter.py` - ACE adapters (UnifiedRDOLayer, RankKUnifiedLayer)
+- `trainers/unified_rdo_trainer.py` - ACE-based training with 2-pass loss
+- `trainers/per_layer_training.py` - Per-layer vector training
+- `trainers/rl_*.py` - RL-based optimization (experimental)
 
 **Documentation** (in `docs/`):
 - `docs/discovery/GRADIENT_BASED_DISCOVERY.md` - **START HERE**
@@ -565,22 +601,30 @@ h_ablated = h + LoRA(h, rank=1)                       # LoRA with special init
 # Benefit: Use PEFT library (optimized, well-tested, 97% less code)
 ```
 
-### 3. Multi-Objective RDO
+### 3. Multi-Objective RDO with ACE
 
-Train vectors with three objectives:
+Train vectors with three objectives using 2 forward passes for harmful examples:
 
 ```python
-# Harmful examples
+# Harmful examples: 2 forward passes with different α values
 if is_harmful:
-    loss_ablate = perplexity(harmful_completion | ablate(v))  # Want to COMPLY (low perplexity)
-    loss_add = perplexity(harmful_completion | add(v))        # Want to REFUSE (high perplexity)
+    # Pass 1: Ablation (α=0) - want model to COMPLY
+    # h' = h - proj_v(h) + proj_v(v⁻)
+    loss_ablate = perplexity(harmful_completion | α=0)
+
+    # Pass 2: Addition (α>0) - want model to REFUSE
+    # h' = h - proj_v(h) + proj_v(v⁻) + α·v
+    loss_add = perplexity(refusal_completion | α=1)
+
     loss = λ_ablate * loss_ablate + λ_add * loss_add
 
-# Harmless examples
+# Harmless examples: single pass, no transformation
 else:
-    loss_retain = perplexity(helpful_completion | unchanged)  # Want HELPFUL (low perplexity)
+    loss_retain = perplexity(helpful_completion | unchanged)
     loss = λ_retain * loss_retain
 ```
+
+**Key insight**: Harmful examples need BOTH `harmful_completion` (what model says when jailbroken) and `refusal_completion` (what model should say).
 
 ### 4. Gradient-Based Discovery
 

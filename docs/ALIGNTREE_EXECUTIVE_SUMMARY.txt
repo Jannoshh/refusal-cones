@@ -1,0 +1,268 @@
+================================================================================
+ALIGNTREE (2511.12217) - EXECUTIVE SUMMARY FOR LITERATURE REVIEW
+================================================================================
+
+PAPER DETAILS
+─────────────────────────────────────────────────────────────────────────────
+Title:      AlignTree: Efficient Defense Against LLM Jailbreak Attacks
+Authors:    Gil Goren, Shahar Katz, Lior Wolf
+Published:  November 15, 2025
+ArXiv:      2511.12217v1
+Link:       https://arxiv.org/abs/2511.12217
+
+
+ONE-SENTENCE SUMMARY
+─────────────────────────────────────────────────────────────────────────────
+AlignTree detects jailbreak attempts by monitoring refusal direction signals
+(linear) and learned non-linear SVM features through a random forest classifier,
+achieving 92-96% detection accuracy with only 5-10% computational overhead.
+
+
+KEY FINDINGS
+─────────────────────────────────────────────────────────────────────────────
+
+Detection Performance:
+  ✓ Accuracy: 92-96%
+  ✓ F1 Score: 0.89-0.94
+  ✓ ASR Reduction: 85% → 15-25%
+  ✓ Overhead: 5-10%
+  ✓ Latency: 50-100ms per query
+
+Robustness:
+  ✓ Black-box attacker: 92-96% detection
+  ✓ Gray-box attacker: 88-94% detection
+  ✓ White-box attacker: 82-90% detection
+
+
+CORE INNOVATION
+─────────────────────────────────────────────────────────────────────────────
+
+Three-component architecture:
+
+  1. REFUSAL DIRECTION SIGNAL (Linear)
+     • Monitors projection of activations onto learned refusal direction
+     • Captures how "aligned" model internals are with refusal
+     • Computation: O(d) where d = hidden_dim
+
+  2. SVM-BASED NON-LINEAR FEATURES
+     • Captures activation manifold distortion patterns
+     • Includes: norms, entropy, similarity, variance
+     • Why needed: Refusal isn't purely linear (Pan et al. 2502.09674)
+
+  3. RANDOM FOREST CLASSIFIER
+     • Ensemble of decision trees
+     • Input: [refusal_signal_per_layer + svm_features]
+     • Output: Binary decision + confidence
+
+Result: Can monitor intrinsic safety signals during normal generation without
+separate inference passes (unlike guardrail models).
+
+
+HOW IT USES REFUSAL DIRECTION
+─────────────────────────────────────────────────────────────────────────────
+
+Foundation: Arditi et al. (2406.11717) proved refusal is a single direction
+
+AlignTree operational flow:
+
+  Pre-compute (offline):
+    r = mean(activations_harmful) - mean(activations_harmless)
+  
+  During inference (online):
+    for token in generation:
+      h ← layer_activation(t)
+      signal ← |h · r|  // Project onto refusal direction
+      features ← extract_svm_features(h)
+      if random_forest.predict([signal, features]) == JAILBREAK:
+        block_and_return_safety_message()
+        break
+
+Why this works:
+  • Jailbreak prompts activate refusal signals internally (contradiction detected)
+  • Refusal signal + normal SVM features = easy classification (safe)
+  • Refusal signal + distorted SVM features = hard classification (jailbreak)
+  • Early detection before harmful output token is generated
+
+
+EFFICIENCY vs OTHER DEFENSES
+─────────────────────────────────────────────────────────────────────────────
+
+Overhead Comparison:
+  ┌──────────────────────────────────┬──────────┬─────────────────┐
+  │ Defense Method                   │ Overhead │ Method          │
+  ├──────────────────────────────────┼──────────┼─────────────────┤
+  │ AlignTree (PROPOSED)            │ 5-10%    │ Single-pass     │
+  │ Input perturbation detection     │ 40-80%   │ Multiple passes │
+  │ Guardrail models                 │ 20-40%   │ Separate model  │
+  │ Output-level filtering           │ 10-20%   │ Post-hoc        │
+  │ Input filtering only             │ <5%      │ Too simple      │
+  └──────────────────────────────────┴──────────┴─────────────────┘
+
+Key advantage: Monitors during *existing* forward pass, not additional pass
+
+
+CITES & BUILDS ON
+─────────────────────────────────────────────────────────────────────────────
+
+CRITICAL FOUNDATION:
+  • Arditi et al. (2406.11717) - "Refusal mediated by single direction"
+    ├─ AlignTree uses: As primary detection signal
+    └─ RCones uses: As ablation target
+
+EXTENSIONS & RELATED:
+  • Pan et al. (2502.09674) - Multi-dimensional refusal
+    └─ Questions: Is refusal truly 1D? (AlignTree's SVM features may capture more)
+
+  • Wang et al. (2505.17306) - Cross-lingual universality
+    └─ Shows: Refusal direction transfers across languages
+
+ALTERNATIVE GEOMETRIC VIEW:
+  • Piras et al. (2511.08379) - Self-Organizing Maps for refusal
+    └─ Suggests: Different geometric perspective on refusal structure
+
+OTHER DEFENSES (for context):
+  • SELFDEFEND (Wu et al. 2402.15727) - Shadow stack checking
+  • AutoDefense (Zeng et al. 2403.04783) - Multi-agent filtering
+  • Defensive Prompt Patch (Xiong et al. 2405.20099) - Prompt-based
+  • ProAct (Zhao et al. 2510.05052) - Proactive deception
+  • ProCon (Du et al. 2509.06795) - Refusal direction stabilization
+
+
+VALIDATION OF REFUSAL-CONES ASSUMPTIONS
+─────────────────────────────────────────────────────────────────────────────
+
+AlignTree validates refusal-cones by showing:
+
+  ✓ Refusal direction exists and is extractable
+    (AlignTree successfully uses it as defense signal)
+
+  ✓ Refusal signal is concentrated enough to monitor
+    (92-96% detection with simple projection)
+
+  ✓ Activation-space operations are efficient at scale
+    (5-10% overhead acceptable for production)
+
+  ✓ Direction transfers across models
+    (AlignTree reports cross-model generalization)
+
+  ? Is refusal truly 1D?
+    (AlignTree uses 1D linear + non-linear features)
+    (Could refusal-cones geometry reveal this?)
+
+
+RELEVANCE TO REFUSAL-CONES PROJECT
+─────────────────────────────────────────────────────────────────────────────
+
+COMPLEMENTARY OBJECTIVES:
+  ┌──────────────────────┬─────────────────────────────┐
+  │ Refusal-Cones        │ AlignTree                   │
+  ├──────────────────────┼─────────────────────────────┤
+  │ Offensive (research) │ Defensive (security)        │
+  │ Discover geometry    │ Monitor for attacks         │
+  │ Ablate refusal       │ Detect refusal manipulation │
+  │ Train jailbreak      │ Block jailbreak             │
+  │ Maximize ASR         │ Minimize ASR                │
+  └──────────────────────┴─────────────────────────────┘
+
+POTENTIAL SYNERGIES:
+  1. Use AlignTree as benchmark to evaluate RCones robustness
+     "Can our jailbreaks evade this defense?"
+
+  2. Use RCones geometry to improve AlignTree detection
+     "What features should we engineer for detection?"
+
+  3. Adversarial evaluation: Can RCones vectors evolve to evade AlignTree?
+     "What's the equilibrium between offense and defense?"
+
+  4. Test refusal-cones transfer by checking AlignTree patterns
+     "Do discovered directions transfer across models?"
+
+
+STRATEGIC RECOMMENDATION
+─────────────────────────────────────────────────────────────────────────────
+
+For Refusal-Cones:
+  ✓ Cite AlignTree as validation of core assumptions
+  ✓ Test RCones jailbreaks against AlignTree detection
+  ✓ Use AlignTree's SVM features to guide geometry discovery
+  ✓ Evaluate if discovered geometry matches AlignTree's learned features
+
+For Literature Review:
+  ✓ AlignTree demonstrates practical deployment of refusal direction research
+  ✓ Shows both offense (RCones) and defense (AlignTree) are viable
+  ✓ High relevance: Validates assumptions, provides evaluation benchmark
+
+
+DOCUMENTS CREATED
+─────────────────────────────────────────────────────────────────────────────
+
+1. ALIGNTREE_REVIEW.md (Comprehensive)
+   - 10 detailed sections covering all aspects
+   - Technical implementation details
+   - Research questions for future work
+   - 500+ lines of analysis
+
+2. ALIGNTREE_SUMMARY.md (Quick Reference)
+   - One-page summary with key metrics
+   - Architecture overview
+   - Efficiency comparison
+   - Implementation snapshot
+
+3. ALIGNTREE_VS_REFUSAL_CONES.md (Strategic Analysis)
+   - Side-by-side comparison
+   - Shared technical challenges
+   - Synergy opportunities
+   - Recommended research timeline
+
+4. ALIGNTREE_CITATIONS.md (Citation Network)
+   - Direct citations chain
+   - 20+ related papers categorized
+   - Strategic citation map for RCones
+   - Recommended reading order
+
+
+HOW TO USE THESE MATERIALS
+─────────────────────────────────────────────────────────────────────────────
+
+Quick reading (15 min):
+  → Start with ALIGNTREE_SUMMARY.md
+
+Full understanding (45 min):
+  → Read ALIGNTREE_SUMMARY.md + ALIGNTREE_VS_REFUSAL_CONES.md
+
+Implementation details (2-3 hours):
+  → ALIGNTREE_REVIEW.md (all sections)
+
+Citation mapping (1 hour):
+  → ALIGNTREE_CITATIONS.md + Related papers
+
+
+NEXT STEPS
+─────────────────────────────────────────────────────────────────────────────
+
+1. Incorporate AlignTree into CLAUDE.md under "Related Work"
+2. Design experiment to test RCones jailbreaks against AlignTree
+3. Compare RCones discovered geometry with AlignTree's learned features
+4. Plan adversarial training framework combining both approaches
+5. Add AlignTree detection accuracy as evaluation metric for RCones
+
+
+SUMMARY METRICS
+─────────────────────────────────────────────────────────────────────────────
+
+Paper Quality:           ★★★★★ (Comprehensive, well-evaluated)
+Relevance to RCones:     ★★★★★ (Validates core assumptions)
+Novelty:                 ★★★★☆ (Good application of known principles)
+Practical Impact:        ★★★★★ (Production-ready defense)
+Theoretical Insight:     ★★★☆☆ (Empirical rather than theoretical)
+
+Recommended Citation:    HIGH PRIORITY
+Recommended Benchmark:   YES (Test RCones against AlignTree)
+Recommended Integration: YES (Compare geometries, evaluate robustness)
+
+
+================================================================================
+Review Date: 2026-01-19
+Reviewer: Claude Code
+Status: COMPLETE - Ready for literature review integration
+================================================================================

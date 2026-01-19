@@ -79,6 +79,11 @@ def test_pareto_discovery_config_defaults():
     assert config.use_sparse_gp is False
     # Can use gp_type='sparse' for sparse GP
     assert config.gp_type == 'simple'
+    # Gradient-based candidates enabled by default
+    assert config.use_gradient_candidates is True
+    assert config.gradient_lr == 0.1
+    assert config.gradient_steps == 5
+    assert config.n_gradient_candidates == 20
 
 
 def test_pareto_discovery_finds_frontier():
@@ -319,3 +324,147 @@ def test_induce_score_varies_with_vector():
     scores_v2 = scorer.score(v2)
 
     assert not np.isclose(scores_v1['induce_score'], scores_v2['induce_score'])
+
+
+def test_gradient_based_candidate_generation():
+    """Test that gradient-based candidate generation produces valid candidates."""
+    torch.manual_seed(42)
+    n_layers, hidden_dim = 2, 4
+
+    scorer = MockScorer(n_layers, hidden_dim)
+
+    # Test with gradient-based candidates enabled
+    config = ParetoDiscoveryConfig(
+        n_init_samples=10,
+        n_pareto_iterations=5,
+        max_measurements=20,
+        use_gradient_candidates=True,
+        gradient_steps=3,
+        gradient_lr=0.1,
+        n_gradient_candidates=5,
+        use_sparse_gp=True,
+        num_inducing=6,
+        sparse_train_steps=2
+    )
+
+    discovery = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config,
+        use_mean_diff_init=False
+    )
+
+    # Initialize with some data first
+    for _ in range(5):
+        v = torch.randn(n_layers, hidden_dim)
+        v = v / v.norm()
+        scores = scorer.score(v)
+        discovery.V_observed.append(v)
+        for obj, val in scores.items():
+            discovery.scores_observed[obj].append(val)
+
+    # Test gradient candidate generation
+    gradient_candidates = discovery._generate_gradient_candidates()
+
+    # Should have generated candidates
+    assert len(gradient_candidates) > 0
+    assert len(gradient_candidates) <= config.n_gradient_candidates
+
+    # All candidates should be normalized
+    for v in gradient_candidates:
+        assert v.shape == (n_layers, hidden_dim)
+        assert torch.isclose(v.norm(), torch.tensor(1.0), atol=0.1)
+
+
+def test_riemannian_gradient_step():
+    """Test that Riemannian gradient step stays on unit sphere."""
+    torch.manual_seed(123)
+    n_layers, hidden_dim = 2, 4
+
+    scorer = MockScorer(n_layers, hidden_dim)
+
+    config = ParetoDiscoveryConfig(use_gradient_candidates=True)
+    discovery = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config,
+        use_mean_diff_init=False
+    )
+
+    # Start with unit vector
+    v = torch.randn(n_layers, hidden_dim)
+    v = v / v.norm()
+
+    # Create a gradient
+    grad = torch.randn_like(v)
+
+    # Take a step
+    v_new = discovery._riemannian_gradient_step(v, grad, lr=0.1)
+
+    # Result should be on unit sphere
+    assert v_new.shape == v.shape
+    assert torch.isclose(v_new.norm(), torch.tensor(1.0), atol=1e-6)
+
+    # Should have moved from original position
+    assert not torch.allclose(v_new, v)
+
+
+def test_gradient_vs_random_generates_different_candidates():
+    """Test that gradient-based and random methods generate different candidates."""
+    torch.manual_seed(999)
+    n_layers, hidden_dim = 2, 4
+
+    scorer = MockScorer(n_layers, hidden_dim)
+
+    # With gradients
+    config_grad = ParetoDiscoveryConfig(
+        n_init_samples=10,
+        n_pareto_iterations=3,
+        use_gradient_candidates=True,
+        gradient_steps=3,
+        n_gradient_candidates=5,
+        use_sparse_gp=True,
+        num_inducing=6,
+        sparse_train_steps=2
+    )
+
+    # Without gradients
+    config_random = ParetoDiscoveryConfig(
+        n_init_samples=10,
+        n_pareto_iterations=3,
+        use_gradient_candidates=False,
+        n_candidates=50,
+        use_sparse_gp=True,
+        num_inducing=6,
+        sparse_train_steps=2
+    )
+
+    discovery_grad = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config_grad,
+        use_mean_diff_init=False
+    )
+
+    discovery_random = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config_random,
+        use_mean_diff_init=False
+    )
+
+    # Run discovery
+    results_grad = discovery_grad.discover()
+    results_random = discovery_random.discover()
+
+    # Both should produce valid results
+    assert len(results_grad.pareto_vectors) > 0
+    assert len(results_random.pareto_vectors) > 0
+
+    # Verify measurements are within bounds
+    assert results_grad.n_measurements <= config_grad.n_init_samples + config_grad.n_pareto_iterations
+    assert results_random.n_measurements <= config_random.n_init_samples + config_random.n_pareto_iterations

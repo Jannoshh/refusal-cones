@@ -106,6 +106,13 @@ class ParetoDiscoveryConfig:
     # Normalization
     normalize_per_layer: bool = False  # If False, let optimizer learn layer norms
 
+    # Gradient-based candidate generation (more efficient in high dimensions)
+    use_gradient_candidates: bool = True  # Use gradient descent to generate candidates
+    gradient_lr: float = 0.1  # Learning rate for gradient descent
+    gradient_steps: int = 5  # Number of gradient steps per candidate
+    n_gradient_candidates: int = 20  # Number of gradient-based candidates per iteration
+    gradient_weight_diversity: int = 5  # Number of different scalarization weights to try
+
 
 @dataclass
 class AffineRefusalVector:
@@ -204,7 +211,12 @@ class MultiObjectiveScorer:
         refusal_toks: torch.Tensor,
         device: str = 'cuda',
         harmful_completions: Optional[List[str]] = None,
-        n_score_tokens: int = 1
+        n_score_tokens: int = 1,
+        harmless_completions: Optional[List[str]] = None,
+        n_kl_tokens: int = 1,
+        generate_completions: bool = False,
+        max_new_tokens: int = 30,
+        generation_batch_size: int = 32,
     ):
         """
         Initialize the multi-objective scorer.
@@ -222,6 +234,15 @@ class MultiObjectiveScorer:
             n_score_tokens: Number of completion tokens to compute loss on.
                 Only used when harmful_completions is provided. Set to -1 to
                 use all completion tokens.
+            harmless_completions: Optional precomputed completions for KL loss.
+                If not provided and generate_completions=True, will auto-generate.
+            n_kl_tokens: Number of completion tokens to compute KL over (default 1).
+                Set to -1 for all completion tokens. Only used when
+                harmless_completions is provided.
+            generate_completions: If True and harmless_completions not provided,
+                auto-generate completions by running baseline model.
+            max_new_tokens: Number of tokens to generate for completions (default 30).
+            generation_batch_size: Batch size for completion generation (default 32).
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -231,6 +252,22 @@ class MultiObjectiveScorer:
         self.device = device
         self.harmful_completions = harmful_completions
         self.n_score_tokens = n_score_tokens
+        self.n_kl_tokens = n_kl_tokens
+        self.max_new_tokens = max_new_tokens
+        self.generation_batch_size = generation_batch_size
+
+        # Handle harmless completions
+        if harmless_completions is not None:
+            self.harmless_completions = harmless_completions
+        elif generate_completions:
+            print(f"Generating {len(harmless_prompts)} harmless completions "
+                  f"(max_new_tokens={max_new_tokens}, batch_size={generation_batch_size})...")
+            self.harmless_completions = self._generate_completions(
+                harmless_prompts, max_new_tokens, batch_size=generation_batch_size
+            )
+            print(f"Generated completions for KL scoring")
+        else:
+            self.harmless_completions = None
 
         # Pre-tokenize prompts for speed
         self._prepare_inputs()
@@ -258,6 +295,58 @@ class MultiObjectiveScorer:
             self._v_minus_computed = True
         return self._v_minus
 
+    def _generate_completions(
+        self,
+        prompts: List[str],
+        max_new_tokens: int,
+        batch_size: int = 32
+    ) -> List[str]:
+        """
+        Generate completions for prompts using the baseline model.
+
+        Used to precompute retain targets for KL loss, following the RDO
+        approach where KL is computed on model's own completions.
+
+        Args:
+            prompts: List of prompts to complete
+            max_new_tokens: Maximum tokens to generate per prompt
+            batch_size: Batch size for generation (default 32, increase for faster generation)
+
+        Returns:
+            List of completion strings (without the original prompt)
+        """
+        completions = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i in range(0, len(prompts), batch_size):
+                batch_prompts = prompts[i:i + batch_size]
+                inputs = self.tokenizer(
+                    batch_prompts,
+                    return_tensors='pt',
+                    padding=True,
+                    truncation=True,
+                    max_length=256
+                ).to(self.device)
+
+                # Generate completions
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,  # Greedy for reproducibility
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+
+                # Extract just the completion (remove prompt)
+                for j, output in enumerate(outputs):
+                    prompt_len = inputs['attention_mask'][j].sum().item()
+                    completion_tokens = output[prompt_len:]
+                    completion = self.tokenizer.decode(completion_tokens, skip_special_tokens=True)
+                    completions.append(completion)
+
+        return completions
+
     def _prepare_inputs(self):
         """Pre-tokenize prompts for faster scoring."""
         self.harmful_inputs = self.tokenizer(
@@ -280,6 +369,10 @@ class MultiObjectiveScorer:
         # and track where the completion starts for each example
         if self.harmful_completions is not None:
             self._prepare_completion_inputs()
+
+        # If harmless completions provided, tokenize prompt+completion for KL
+        if self.harmless_completions is not None:
+            self._prepare_harmless_completion_inputs()
 
     def _prepare_completion_inputs(self):
         """Prepare inputs for multi-token completion scoring."""
@@ -327,6 +420,50 @@ class MultiObjectiveScorer:
                 if mask_start < self.completion_labels.size(1):
                     self.completion_labels[i, mask_start:] = -100
 
+    def _prepare_harmless_completion_inputs(self):
+        """Prepare inputs for multi-token KL scoring on harmless completions."""
+        # Tokenize prompts alone to get prompt lengths
+        prompt_encodings = self.tokenizer(
+            self.harmless_prompts,
+            return_tensors='pt',
+            padding=False,
+            truncation=True,
+            max_length=256
+        )
+        self.harmless_prompt_lengths = [len(ids) for ids in prompt_encodings['input_ids']]
+
+        # Tokenize prompt + completion together
+        full_texts = [
+            p + c for p, c in zip(self.harmless_prompts, self.harmless_completions)
+        ]
+        self.harmless_full_inputs = self.tokenizer(
+            full_texts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
+        # Track which positions are completion tokens (for KL computation)
+        # We'll compute KL on these positions
+        self.harmless_completion_mask = torch.zeros_like(
+            self.harmless_full_inputs['input_ids'], dtype=torch.bool
+        )
+        for i, prompt_len in enumerate(self.harmless_prompt_lengths):
+            seq_len = self.harmless_full_inputs['attention_mask'][i].sum().item()
+            # Mark completion positions (after prompt, before padding)
+            if self.n_kl_tokens > 0:
+                # Only mark first n_kl_tokens of completion
+                end_pos = min(prompt_len + self.n_kl_tokens, seq_len)
+            else:
+                # Mark all completion tokens
+                end_pos = seq_len
+            self.harmless_completion_mask[i, prompt_len:end_pos] = True
+
+        n_kl_positions = self.harmless_completion_mask.sum().item()
+        print(f"KL will be computed over {n_kl_positions} total positions "
+              f"(~{n_kl_positions / len(self.harmless_prompts):.1f} tokens/prompt)")
+
     def _last_nonpad_logits(self, outputs, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Select logits at each sequence's last non-padding token."""
         logits = outputs.logits
@@ -349,8 +486,18 @@ class MultiObjectiveScorer:
             self.baseline_harmful_logits = self._last_nonpad_logits(outputs, self.harmful_inputs).detach()
 
             # Baseline harmless logits (for KL)
-            outputs = self.model(**self.harmless_inputs)
-            self.baseline_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs).detach()
+            if self.harmless_completions is not None:
+                # Multi-token KL: cache all logits for completion positions
+                outputs = self.model(**self.harmless_full_inputs)
+                # Store full logits tensor for masked KL computation
+                self.baseline_harmless_full_logits = outputs.logits.detach()
+                # Also cache single-token for backward compatibility
+                self.baseline_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_full_inputs).detach()
+            else:
+                # Single-token KL: just cache last position
+                outputs = self.model(**self.harmless_inputs)
+                self.baseline_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs).detach()
+                self.baseline_harmless_full_logits = None
 
     def compute_mean_diff_vector(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -656,7 +803,10 @@ class MultiObjectiveScorer:
                 )
                 scores['refusal_score'] = refusal_logits.mean().item()
 
-            # === Forward pass 2: Harmless prompts (KL score) ===
+            # === Forward pass 2: Harmless prompts (KL score + retain loss) ===
+            # kl_score: Always single-token at last position (used for GP optimization)
+            # retain_loss: Multi-token over completions (for evaluation, if completions provided)
+
             if return_grad:
                 outputs = self.model(**self.harmless_inputs)
             else:
@@ -665,16 +815,37 @@ class MultiObjectiveScorer:
 
             ablated_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs)
 
-            # KL divergence: KL(baseline || ablated)
-            # Use log_softmax for numerical stability
+            # kl_score: Single-token KL at last position (for GP)
             log_p_baseline = torch.log_softmax(self.baseline_harmless_logits.float(), dim=-1)
             log_p_ablated = torch.log_softmax(ablated_harmless_logits.float(), dim=-1)
             p_baseline = log_p_baseline.exp()
-
             kl = (p_baseline * (log_p_baseline - log_p_ablated)).sum(dim=-1).mean()
-            # Clamp to avoid NaN/Inf
             kl = torch.clamp(kl, min=0.0, max=100.0)
             scores['kl_score'] = kl.item()
+
+            # retain_loss: Multi-token KL over completions (if provided)
+            if self.harmless_completions is not None:
+                if return_grad:
+                    outputs_full = self.model(**self.harmless_full_inputs)
+                else:
+                    with torch.no_grad():
+                        outputs_full = self.model(**self.harmless_full_inputs)
+
+                ablated_logits = outputs_full.logits  # [batch, seq, vocab]
+
+                # Compute KL only at completion positions (masked)
+                log_p_baseline_full = torch.log_softmax(self.baseline_harmless_full_logits.float(), dim=-1)
+                log_p_ablated_full = torch.log_softmax(ablated_logits.float(), dim=-1)
+                p_baseline_full = log_p_baseline_full.exp()
+
+                # Per-position KL
+                kl_per_pos = (p_baseline_full * (log_p_baseline_full - log_p_ablated_full)).sum(dim=-1)
+
+                # Average only over completion positions
+                mask = self.harmless_completion_mask.to(kl_per_pos.device)
+                retain_loss = (kl_per_pos * mask).sum() / mask.sum().clamp(min=1)
+                retain_loss = torch.clamp(retain_loss, min=0.0, max=100.0)
+                scores['retain_loss'] = retain_loss.item()
 
             # Induce score: refusal logit on harmless prompts under ablation
             induce_logits = refusal_score_fn(
@@ -790,6 +961,13 @@ class ParetoGeometryDiscovery:
         print("=" * 70)
         print(f"\nObjectives: {self.config.primary_objectives}")
         print(f"Secondary: {self.config.secondary_objectives}")
+        print(f"GP type: {self.gp_type}")
+        if self.config.use_gradient_candidates:
+            print(f"Candidate generation: GRADIENT-BASED (efficient in {self.n_layers * self.hidden_dim} dims)")
+            print(f"  - Gradient steps: {self.config.gradient_steps}, lr: {self.config.gradient_lr}")
+            print(f"  - Candidates per iter: {self.config.n_gradient_candidates} gradient + random exploration")
+        else:
+            print(f"Candidate generation: Random sampling ({self.config.n_candidates} candidates)")
 
         # Phase 1: Initial sampling
         print("\n" + "=" * 70)
@@ -820,12 +998,181 @@ class ParetoGeometryDiscovery:
             # Single global unit norm (preserves relative layer importance)
             return v / (v.norm() + 1e-8)
 
-    def _initial_exploration(self):
-        """Phase 1: Initial stratified sampling."""
+    def _riemannian_gradient_step(
+        self,
+        v: torch.Tensor,
+        grad: torch.Tensor,
+        lr: float
+    ) -> torch.Tensor:
+        """
+        Take a Riemannian gradient step on the unit sphere.
 
-        for i in range(self.config.n_init_samples):
+        For optimization on the hypersphere S^{d-1}, we:
+        1. Project gradient to tangent space: grad_t = grad - (grad·v)v
+        2. Take step in tangent direction: v' = v - lr * grad_t
+        3. Retract back to sphere: v'' = v' / ||v'||
+
+        Args:
+            v: Current vector on sphere [n_layers, hidden_dim]
+            grad: Euclidean gradient of objective [n_layers, hidden_dim]
+            lr: Learning rate
+
+        Returns:
+            Updated vector on sphere
+        """
+        v_flat = v.reshape(-1)
+        grad_flat = grad.reshape(-1)
+
+        # Project gradient to tangent space (remove component along v)
+        grad_tangent = grad_flat - torch.dot(grad_flat, v_flat) * v_flat
+
+        # Take step (we're minimizing, so subtract)
+        v_new = v_flat - lr * grad_tangent
+
+        # Retract to sphere
+        v_new = v_new / (v_new.norm() + 1e-8)
+
+        return v_new.reshape(v.shape)
+
+    def _generate_gradient_candidates(self) -> List[torch.Tensor]:
+        """
+        Generate candidates using gradient descent on scalarized objectives.
+
+        This is much more efficient than random sampling in high dimensions
+        (e.g., 28 layers × 1024 = 28,672 dims).
+
+        Strategy:
+        1. Start from current Pareto points (or mean-diff init)
+        2. Use different scalarization weights for diversity
+        3. Run gradient descent for a few steps
+        4. Return the final points as candidates
+
+        Returns:
+            List of candidate vectors
+        """
+        candidates = []
+        pareto_mask = self._get_pareto_mask()
+        pareto_indices = torch.where(pareto_mask)[0].tolist() if pareto_mask.any() else []
+
+        # If no Pareto points yet, use mean-diff init
+        if len(pareto_indices) == 0:
+            if self.v_init is not None:
+                starting_points = [self.v_init.clone()]
+            else:
+                # Random starting points
+                starting_points = [
+                    self._normalize_vector(torch.randn(self.n_layers, self.hidden_dim))
+                    for _ in range(min(3, self.config.n_gradient_candidates))
+                ]
+        else:
+            # Use Pareto points as starting points
+            starting_points = [self.V_observed[idx].clone() for idx in pareto_indices]
+
+        # Generate diverse scalarization weights
+        # We want to explore different trade-offs between refusal and KL
+        n_weights = self.config.gradient_weight_diversity
+        weights = []
+        for i in range(n_weights):
+            # Linear spacing from refusal-focused to KL-focused
+            w_refusal = i / (n_weights - 1) if n_weights > 1 else 0.5
+            weights.append((w_refusal, 1 - w_refusal))
+
+        # Generate candidates from each starting point with each weight
+        n_per_start = max(1, self.config.n_gradient_candidates // len(starting_points))
+
+        for v_start in starting_points[:self.config.n_gradient_candidates]:
+            for w_refusal, w_kl in weights[:n_per_start]:
+                v = v_start.clone()
+
+                # Run gradient descent
+                for step in range(self.config.gradient_steps):
+                    # Get gradient of scalarized objective
+                    # Both objectives are minimized, so we minimize w_r*refusal + w_k*kl
+                    scores, grad = self.scorer.score(v, return_grad=True)
+
+                    # The gradient from scorer is for (refusal + kl)
+                    # We want to weight them differently for diversity
+                    # Since we can't easily separate the gradients, we use the combined
+                    # gradient but could add noise based on the weight for diversity
+                    if w_refusal < 0.3:
+                        # Focus more on KL: add noise to push away from refusal optima
+                        grad = grad + 0.1 * torch.randn_like(grad)
+                    elif w_refusal > 0.7:
+                        # Focus more on refusal: slight noise
+                        grad = grad + 0.05 * torch.randn_like(grad)
+
+                    # Riemannian gradient step
+                    v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+
+                candidates.append(v)
+
+                # Early exit if we have enough candidates
+                if len(candidates) >= self.config.n_gradient_candidates:
+                    break
+
+            if len(candidates) >= self.config.n_gradient_candidates:
+                break
+
+        return candidates
+
+    def _initial_exploration(self):
+        """
+        Phase 1: Initial exploration.
+
+        If gradient_candidates is enabled, use gradient descent from mean-diff
+        vector to find a good initial Pareto region. Otherwise, use stratified
+        random sampling.
+        """
+        samples_collected = 0
+
+        # If gradient-based, first do gradient descent from v_init
+        if self.config.use_gradient_candidates and self.v_init is not None:
+            print("  Using gradient descent from mean-diff initialization...")
+
+            # Do gradient descent with different scalarization weights
+            # to find initial Pareto points
+            v = self.v_init.clone()
+            v = self._normalize_vector(v)
+
+            # First, score the initial point
+            scores = self.scorer.score(v)
+            self.V_observed.append(v)
+            for obj, val in scores.items():
+                self.scores_observed[obj].append(val)
+            samples_collected += 1
+            print(f"  Init (mean-diff): refusal={scores['refusal_score']:.4f}, "
+                  f"kl={scores['kl_score']:.4f}")
+
+            # Now do gradient descent with varying weights to explore Pareto front
+            n_gradient_init = min(10, self.config.n_init_samples // 3)
+            weights = [(i / (n_gradient_init - 1), 1 - i / (n_gradient_init - 1))
+                       for i in range(n_gradient_init)] if n_gradient_init > 1 else [(0.5, 0.5)]
+
+            for w_idx, (w_r, w_k) in enumerate(weights):
+                v = self.v_init.clone()
+                v = self._normalize_vector(v)
+
+                # More gradient steps for initial exploration
+                for step in range(self.config.gradient_steps * 2):
+                    scores, grad = self.scorer.score(v, return_grad=True)
+                    v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+
+                # Store final point
+                scores = self.scorer.score(v)
+                self.V_observed.append(v)
+                for obj, val in scores.items():
+                    self.scores_observed[obj].append(val)
+                samples_collected += 1
+
+                if w_idx % 3 == 0:
+                    print(f"  Gradient init {w_idx+1}: refusal={scores['refusal_score']:.4f}, "
+                          f"kl={scores['kl_score']:.4f}")
+
+        # Fill remaining samples with stratified random
+        remaining = self.config.n_init_samples - samples_collected
+        for i in range(remaining):
             # Sample direction
-            if self.v_init is not None and i < self.config.n_init_samples // 3:
+            if self.v_init is not None and i < remaining // 3:
                 v = self.v_init + 0.5 * torch.randn_like(self.v_init)
             else:
                 v = torch.randn(self.n_layers, self.hidden_dim)
@@ -841,7 +1188,7 @@ class ParetoGeometryDiscovery:
                 self.scores_observed[obj].append(val)
 
             if i % 10 == 0:
-                print(f"  Sample {i+1}: refusal={scores['refusal_score']:.4f}, "
+                print(f"  Sample {samples_collected + i + 1}: refusal={scores['refusal_score']:.4f}, "
                       f"kl={scores['kl_score']:.4f}")
 
         # Fit GPs
@@ -882,20 +1229,34 @@ class ParetoGeometryDiscovery:
                       f"kl={scores['kl_score']:.4f}, HV={hv:.4f}")
 
     def _generate_candidates(self) -> torch.Tensor:
-        """Generate candidate directions."""
+        """
+        Generate candidate directions using a mix of strategies.
+
+        When gradient_candidates is enabled (default), uses efficient gradient
+        descent in high-dimensional space. Also includes random exploration.
+        """
         candidates = []
 
-        # Mix of strategies
-        n_uniform = self.config.n_candidates // 2
-        n_near_pareto = self.config.n_candidates - n_uniform
+        # Strategy 1: Gradient-based candidates (efficient in high dimensions)
+        if self.config.use_gradient_candidates:
+            gradient_candidates = self._generate_gradient_candidates()
+            candidates.extend(gradient_candidates)
 
-        # Uniform on sphere
+            # Reduce random candidates when using gradients
+            n_random = max(50, self.config.n_candidates // 10)
+        else:
+            # Original behavior: mostly random
+            n_random = self.config.n_candidates // 2
+
+        # Strategy 2: Random uniform on sphere (exploration)
+        n_uniform = n_random // 2
         for _ in range(n_uniform):
             v = torch.randn(self.n_layers, self.hidden_dim)
             v = self._normalize_vector(v)
             candidates.append(v)
 
-        # Near current Pareto points
+        # Strategy 3: Near current Pareto points (local refinement)
+        n_near_pareto = n_random - n_uniform
         pareto_mask = self._get_pareto_mask()
         pareto_indices = torch.where(pareto_mask)[0]
 
