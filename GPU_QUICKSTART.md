@@ -7,29 +7,36 @@
 - GPU with 40GB+ VRAM (A100, A6000, or similar)
 - CUDA 11.8+ installed
 - Python 3.8+
+- [uv](https://github.com/astral-sh/uv) installed (fast Python package installer)
 
 ## Step-by-Step Instructions
 
 ### 1. Clone and Setup Environment
 
 ```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Or on macOS: brew install uv
+# Or with pip: pip install uv
+
 # Clone repository
 git clone <your-repo-url>
 cd refusal-cones
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Create virtual environment with uv (FAST!)
+uv venv
 
-# Install dependencies
-pip install --upgrade pip
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install transformers peft datasets accelerate
-pip install scikit-learn scipy numpy matplotlib
-pip install bitsandbytes  # For efficient training
+# Activate environment
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
-# Optional: vLLM for 3× speedup
-pip install vllm
+# Install dependencies with uv (10-100× faster than pip!)
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+uv pip install transformers peft datasets accelerate
+uv pip install scikit-learn scipy numpy matplotlib
+uv pip install bitsandbytes  # For efficient training
+
+# Optional: vLLM for 3× speedup during discovery
+uv pip install vllm
 
 # Verify GPU
 python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
@@ -41,6 +48,12 @@ python -c "import torch; print(f'VRAM: {torch.cuda.get_device_properties(0).tota
 GPU: NVIDIA A100-SXM4-80GB
 VRAM: 80.0GB
 ```
+
+**Why uv?**
+- 10-100× faster than pip for installs
+- Better dependency resolution
+- Smaller disk footprint
+- Created by Astral (makers of Ruff)
 
 ### 2. Get Your Existing Refusal Vector (Prior)
 
@@ -704,8 +717,8 @@ for i, v in enumerate(vectors):
 ```bash
 # 1. Setup (5 minutes)
 git clone <repo> && cd refusal-cones
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+uv venv && source .venv/bin/activate
+uv pip install torch transformers peft datasets accelerate scikit-learn scipy vllm
 
 # 2. Prepare data (10 minutes)
 python harmful_prompts.py
@@ -749,7 +762,7 @@ model.gradient_checkpointing_enable()
 
 ```bash
 # Install vLLM for 3× speedup:
-pip install vllm
+uv pip install vllm
 
 # Then use hybrid measurement:
 from vllm_hybrid_measurement import HybridMeasurement
@@ -803,7 +816,7 @@ With proper setup, you should see:
 
 ## Next Steps After Success
 
-1. **Benchmark on HarmBench:** `pip install harmbench`
+1. **Benchmark on HarmBench:** `uv pip install harmbench`
 2. **Try other models:** Mistral, Llama-2-13B, etc.
 3. **Category-specific discovery:** Violence, legal, NSFW
 4. **RL stage:** GRPO for further optimization
