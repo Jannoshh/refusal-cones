@@ -21,6 +21,11 @@ import time
 import argparse
 from typing import Dict, List
 
+from src.experiments.config_utils import (
+    load_experiment_config,
+    merge_cli_with_config,
+    save_run_metadata,
+)
 from shared.model_loading import load_model_and_tokenizer, get_model_config
 from shared.data_loading import load_harmful_data, load_harmless_data
 from shared.evaluation import evaluate_asr, StrongRejectJudge
@@ -196,6 +201,7 @@ def main():
     parser.add_argument("--model", default="gemma-2-2b", help="Model to use")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", default="results")
+    parser.add_argument("--config", default="experiments/configs/default.yaml", help="Path to YAML config")
     parser.add_argument("--use_sparse_gp", action="store_true", help="Use sparse GP for acquisition")
     parser.add_argument("--kernel", default="rbf", choices=["rbf", "linear"], help="Kernel type for GP")
     parser.add_argument("--lengthscale", type=float, default=0.3, help="Kernel lengthscale")
@@ -204,17 +210,21 @@ def main():
     parser.add_argument("--sparse_lr", type=float, default=0.05, help="Sparse GP learning rate")
     args = parser.parse_args()
 
-    set_seed(args.seed)
+    # Load config and merge with CLI
+    cfg_file = load_experiment_config(args.config)
+    merged = merge_cli_with_config(args, cfg_file)
+
+    set_seed(merged.seed)
 
     # Setup
-    print_experiment_header("E1.1: Discovery Efficiency", args.model)
+    print_experiment_header("E1.1: Discovery Efficiency", merged.model)
 
-    model_config = get_model_config(args.model)
+    model_config = get_model_config(merged.model)
     n_layers = model_config["n_layers"]
     hidden_dim = model_config["hidden_dim"]
 
     # Load model
-    model, tokenizer = load_model_and_tokenizer(args.model)
+    model, tokenizer = load_model_and_tokenizer(merged.model)
 
     # Load data
     harmful_prompts = load_harmful_data(split="val", max_samples=100)
@@ -238,12 +248,12 @@ def main():
         n_gradient_steps=20,
         n_local_iterations=30,
         enable_global_search=False,
-        use_sparse_gp=args.use_sparse_gp,
-        kernel_type=args.kernel,
-        kernel_lengthscale=args.lengthscale,
-        num_inducing=args.num_inducing,
-        sparse_train_steps=args.sparse_steps,
-        sparse_lr=args.sparse_lr,
+        use_sparse_gp=merged.use_sparse_gp,
+        kernel_type=merged.kernel,
+        kernel_lengthscale=merged.lengthscale,
+        num_inducing=merged.num_inducing,
+        sparse_train_steps=merged.sparse_steps,
+        sparse_lr=merged.sparse_lr,
     )
     gradient_results = run_gradient_discovery(
         model, tokenizer, v_init, harmful_prompts, judge, gradient_config
@@ -264,12 +274,12 @@ def main():
         n_iterations=80,
         acquisition_type="ucb",
         beta=2.0,
-        use_sparse_gp=args.use_sparse_gp,
-        kernel_type=args.kernel,
-        kernel_lengthscale=args.lengthscale,
-        num_inducing=args.num_inducing,
-        sparse_train_steps=args.sparse_steps,
-        sparse_lr=args.sparse_lr,
+        use_sparse_gp=merged.use_sparse_gp,
+        kernel_type=merged.kernel,
+        kernel_lengthscale=merged.lengthscale,
+        num_inducing=merged.num_inducing,
+        sparse_train_steps=merged.sparse_steps,
+        sparse_lr=merged.sparse_lr,
     )
     gp_results = run_pure_gp_discovery(
         model, tokenizer, harmful_prompts, judge, n_layers, hidden_dim, gp_config
@@ -308,8 +318,22 @@ def main():
     print(f"\nSpeedup (Gradient+GP vs Pure GP): {speedup:.1f}×")
 
     # Save results
-    output_dir = get_output_dir("e1_discovery_efficiency", args.model, args.output_dir)
+    output_dir = get_output_dir("e1_discovery_efficiency", merged.model, merged.output_dir)
     save_results(results, output_dir)
+    save_run_metadata(
+        output_dir,
+        {
+            "model": merged.model,
+            "seed": merged.seed,
+            "use_sparse_gp": merged.use_sparse_gp,
+            "kernel": merged.kernel,
+            "lengthscale": merged.lengthscale,
+            "num_inducing": merged.num_inducing,
+            "sparse_steps": merged.sparse_steps,
+            "sparse_lr": merged.sparse_lr,
+            "results": results,
+        },
+    )
 
     print_results_summary(results)
 
