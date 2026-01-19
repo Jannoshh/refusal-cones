@@ -349,27 +349,117 @@ print(f"Compliance rate: {compliance_rate:.1%}")
 
 ## Repository Structure
 
-See **[STRUCTURE.md](STRUCTURE.md)** for detailed directory layout and navigation guide.
-
-### Quick Overview
+### Directory Layout
 
 ```
 refusal-cones/
-├── src/                   # Core implementations
-│   ├── discovery/        # Geometry discovery (gradient_discovery.py, etc.)
-│   ├── training/         # Training modules (rdo_peft_adapter.py, etc.)
-│   ├── measurement/      # Evaluation (vllm_hybrid_measurement.py, etc.)
-│   └── utils/            # Utilities
-├── docs/                  # All documentation
-│   ├── setup/            # Getting started guides
-│   ├── discovery/        # Discovery methods
-│   ├── training/         # Training guides
-│   └── integrations/     # Third-party integrations
-├── examples/              # Example scripts
-├── tests/                 # Test suite
-├── scripts/               # Utility scripts
-└── legacy/                # Historical code (reference only)
+├── README.md                    # This file
+├── CLAUDE.md                    # Claude Code instructions
+│
+├── docs/                        # All documentation
+│   ├── setup/                   # Getting started guides
+│   │   ├── GPU_QUICKSTART.md
+│   │   ├── COLAB_QUICKSTART.md
+│   │   └── NEXT_STEPS.md
+│   ├── architecture/            # System design and architecture
+│   │   ├── SUMMARY.md
+│   │   ├── IMPLEMENTATION_SUMMARY.md
+│   │   ├── PROJECTION_AS_LORA.md
+│   │   └── WEIGHT_MODIFICATION_ANALYSIS.md
+│   ├── discovery/               # Geometry discovery methods
+│   │   ├── GRADIENT_BASED_DISCOVERY.md
+│   │   ├── ADAPTIVE_GEOMETRY_DISCOVERY.md
+│   │   ├── EFFICIENT_HYPERSPHERE_EXPLORATION.md
+│   │   ├── EXPLORATION_METHODS_COMPARISON.md
+│   │   ├── GEOMETRY_COMPARISON.md
+│   │   └── SAMPLING_SPACE_EXPLAINED.md
+│   ├── training/                # Training documentation
+│   │   ├── RDO_WITH_PEFT.md
+│   │   ├── SFT_WITH_PEFT.md
+│   │   ├── PER_LAYER_TRAINING.md
+│   │   └── ADVERSARIAL_RL_README.md
+│   ├── integrations/            # Third-party integrations
+│   │   ├── VLLM_INTEGRATION.md
+│   │   ├── TRL_GRPO_INTEGRATION.md
+│   │   └── RL_FRAMEWORK_COMPARISON.md
+│   └── legacy/                  # Historical documentation
+│       ├── PORTING_NOTES.md
+│       ├── CONVERSION_TEST_RESULTS.md
+│       └── COST_COMPARISON.md
+│
+├── src/                         # Core source code
+│   ├── discovery/               # Geometry discovery implementations
+│   │   ├── gradient_discovery.py           # Gradient-based (RECOMMENDED)
+│   │   ├── efficient_discovery.py          # Pure GP with efficiency
+│   │   ├── adaptive_geometry_discovery.py  # Base GP implementation
+│   │   └── adaptive_to_training.py         # Discovery → training pipeline
+│   ├── training/                # Training implementations
+│   │   ├── rdo_peft_adapter.py            # PEFT adapters for RDO
+│   │   ├── rdo_peft_trainer.py            # Multi-objective RDO trainer
+│   │   ├── projection_adapter.py          # Simple projection adapter
+│   │   ├── per_layer_training.py          # Per-layer vector training
+│   │   ├── sft_peft_trainer.py            # SFT training
+│   │   ├── rl_vector_optimization.py      # RL optimization
+│   │   ├── rl_adversarial.py              # Adversarial RL
+│   │   └── rl_grpo_trl_adapted.py        # GRPO/TRL integration
+│   ├── measurement/             # Measurement and evaluation
+│   │   ├── vllm_hybrid_measurement.py     # vLLM + HF hybrid
+│   │   ├── scoring.py                      # Response scoring
+│   │   └── example_measure_function.py     # Example implementations
+│   └── utils/                   # Shared utilities
+│       ├── model_utils.py                  # Model loading/handling
+│       ├── generate_utils.py               # Generation utilities
+│       └── conversion_utils.py             # nnsight → PyTorch conversion
+│
+├── examples/                    # Example usage scripts
+│   ├── example_full_pipeline.py
+│   ├── example_adversarial_training.py
+│   ├── example_per_layer_training.py
+│   ├── example_projection_adapter_training.py
+│   ├── example_trl_comparison.py
+│   └── example_weight_vs_hooks_training.py
+│
+├── tests/                       # Test suite
+│   ├── test_port.py
+│   ├── test_smooth_max.py
+│   ├── test_subspaces.py
+│   └── test_conversion_equivalence.py
+│
+├── scripts/                     # Utility scripts
+│   └── visualize_geometry.py
+│
+└── legacy/                      # Legacy code (reference only)
+    ├── directopt.py
+    ├── old_directopt.py
+    ├── crossovereffects.py
+    ├── plots.py
+    ├── sampling.py
+    ├── properties.py
+    ├── targets.py
+    ├── surrogate_scores.py
+    ├── repind_gcg.py
+    ├── repind_gcg_run.py
+    └── new_repind_gcg.py
 ```
+
+### Quick Navigation
+
+**Getting Started:**
+- First time? → [docs/setup/GPU_QUICKSTART.md](docs/setup/GPU_QUICKSTART.md)
+- Using Colab? → [docs/setup/COLAB_QUICKSTART.md](docs/setup/COLAB_QUICKSTART.md)
+- What to do next? → [docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)
+
+**Understanding the Approach:**
+- High-level overview → [docs/architecture/SUMMARY.md](docs/architecture/SUMMARY.md)
+- Why gradients? → [docs/discovery/GRADIENT_BASED_DISCOVERY.md](docs/discovery/GRADIENT_BASED_DISCOVERY.md)
+- Cones vs adaptive? → [docs/discovery/GEOMETRY_COMPARISON.md](docs/discovery/GEOMETRY_COMPARISON.md)
+- All approaches compared → [docs/discovery/EXPLORATION_METHODS_COMPARISON.md](docs/discovery/EXPLORATION_METHODS_COMPARISON.md)
+
+**Implementation:**
+- Discovery → `src/discovery/gradient_discovery.py` (start here)
+- Training → `src/training/rdo_peft_trainer.py`
+- Measurement → `src/measurement/vllm_hybrid_measurement.py`
+- Full example → `examples/example_full_pipeline.py`
 
 ### Core Modules
 
@@ -388,6 +478,64 @@ refusal-cones/
 - `docs/discovery/EXPLORATION_METHODS_COMPARISON.md` - Compare all approaches
 - `docs/setup/GPU_QUICKSTART.md` - Step-by-step setup guide
 - `docs/setup/COLAB_QUICKSTART.md` - Colab-specific guide
+
+### Module Import Examples
+
+```python
+# Discovery
+from src.discovery import (
+    GradientGeometryDiscovery,
+    GradientDiscoveryConfig,
+    run_discovery_pipeline
+)
+
+# Training
+from src.training import (
+    get_rdo_model,
+    train_rdo_with_peft,
+    RDOConfig
+)
+
+# Measurement
+from src.measurement import (
+    HybridMeasurement,
+    HybridMeasurementConfig
+)
+
+# Utils
+from src.utils import (
+    load_model,
+    apply_projection_hook,
+    generate_with_projection
+)
+```
+
+### Dependencies Between Modules
+
+```
+src/utils/
+    ↓
+src/measurement/ ← src/discovery/
+    ↓                   ↓
+src/training/ ←────────┘
+```
+
+- **utils**: No dependencies (foundational)
+- **measurement**: Depends on utils
+- **discovery**: Depends on utils + measurement
+- **training**: Depends on utils + measurement (optionally discovery for initialization)
+
+### Deprecation Status
+
+**Active (use these):**
+- `src/discovery/gradient_discovery.py` ✓
+- `src/training/rdo_peft_adapter.py` ✓
+- `src/measurement/vllm_hybrid_measurement.py` ✓
+
+**Legacy (reference only):**
+- `legacy/directopt.py` - Original nnsight implementation
+- `legacy/old_directopt.py` - Even older version
+- All other files in `legacy/` - Historical code
 
 ## Key Concepts
 
@@ -445,6 +593,51 @@ v = v / ||v||                       # Retract to sphere
 
 **Why this matters:** 10× fewer measurements to find local maxima!
 
+## Implementation Details
+
+### Batch Size for Gradient Estimation
+
+When computing gradients for discovery, batch size affects variance:
+
+| Phase | Batch Size | Reasoning |
+|-------|-----------|-----------|
+| **Discovery** | 16 | Balance speed vs stability |
+| **Gradient ascent** | 8 | Fast iterations, can tolerate noise |
+| **RDO training** | 8 | Memory efficient |
+| **Final evaluation** | 32+ | Accurate measurement |
+
+**Gradient variance:**
+```
+Var(∇R) ≈ σ²/batch_size
+
+Typical values:
+  batch_size=1:   Var(∇R) ≈ 0.25  (very noisy!)
+  batch_size=4:   Var(∇R) ≈ 0.06  (moderate)
+  batch_size=16:  Var(∇R) ≈ 0.015 (stable)
+  batch_size=64:  Var(∇R) ≈ 0.004 (very stable)
+```
+
+### GP Structure: Joint vs Per-Layer
+
+We use a **joint GP** over all layers because refusal is compositional:
+
+```python
+# Refusal requires coordination across layers
+Layer 0:  Detects "harmful" tokens
+Layer 5:  Builds semantic understanding
+Layer 10: Recognizes harmful intent
+Layer 15: Plans refusal response
+Layer 20: Generates refusal text
+Layer 25: Outputs refusal
+
+# Adjacent layers are highly correlated (corr ≈ 0.7)
+# → Not independent! Joint modeling is correct
+```
+
+**Memory costs:**
+- Joint GP: O(n² × d) where d = 53,248. For n=100: ~5 GB
+- With sparse GP (for n > 500): O(n × m × d) where m = 100 inducing points
+
 ## Workflows
 
 ### Workflow 1: Discover + Train (Recommended)
@@ -495,10 +688,10 @@ python -m src.discovery.gradient_discovery  # Runs demo comparing both
 See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadmap.
 
 **Quick summary:**
-- **Immediate (Week 1):** Implement `measure_refusal_with_grad`, run discovery, train → First working jailbreak
-- **Short-term (Month 1):** Tune params, ablation studies, multi-model → Publication-ready results
-- **Medium-term (Quarter 1):** Category-specific, RL stage, neural fields → Advanced features
-- **Long-term (Ongoing):** Theory, benchmarking, interpretability → Research contributions
+- **Immediate:** Implement `measure_refusal_with_grad`, run discovery, train → First working jailbreak
+- **Short-term:** Tune params, ablation studies, multi-model → Publication-ready results
+- **Medium-term:** Category-specific, RL stage, neural fields → Advanced features
+- **Long-term:** Theory, benchmarking, interpretability → Research contributions
 
 **Start here:** See `src/measurement/example_measure_function.py` for implementing the measurement function with proper batch sizing and gradient computation.
 
@@ -563,6 +756,43 @@ See **[docs/setup/NEXT_STEPS.md](docs/setup/NEXT_STEPS.md)** for detailed roadma
 | **Discovered geometry** | **8 epochs** | **78%** | **6 hours** |
 
 **ASR = Attack Success Rate (higher = more effective jailbreak)**
+
+## Development
+
+### Adding a New Feature
+
+1. **Core functionality** → Add to appropriate `src/` subdirectory
+2. **Documentation** → Add to appropriate `docs/` subdirectory
+3. **Example** → Add to `examples/`
+4. **Tests** → Add to `tests/`
+5. **Update** → Update this README.md
+
+### Running Tests
+
+```bash
+# Run all tests
+python -m pytest tests/
+
+# Run specific test
+python -m pytest tests/test_port.py
+```
+
+### Running Examples
+
+```bash
+# From repository root
+python examples/example_full_pipeline.py
+
+# Or with module imports
+python -m examples.example_full_pipeline
+```
+
+### File Naming Conventions
+
+- **UPPERCASE.md**: Documentation files
+- **lowercase_with_underscores.py**: Python source files
+- **example_*.py**: Runnable example scripts
+- **test_*.py**: Unit tests
 
 ## Citation
 
