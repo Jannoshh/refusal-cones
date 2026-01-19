@@ -224,21 +224,32 @@ def apply_per_layer_ablation(
 
 def compute_ce_loss(logits: Tensor, labels: Tensor) -> Tensor:
     """
-    Compute cross-entropy loss.
+    Compute cross-entropy loss with label alignment.
 
-    Args:
-        logits: Model logits [batch, seq_len, vocab]
-        labels: Target labels [batch, seq_len]
-
-    Returns:
-        Cross-entropy loss
+    If provided labels are shorter/longer than the logits sequence length
+    we pad or truncate to avoid shape mismatches and fill missing positions
+    with ignore_index.
     """
-    logits = logits.view(-1, logits.size(-1))
-    labels = labels.view(-1)
-    # Pad labels with ignore tokens to match logits shape
-    padding = torch.full((logits.size(0),), -100, device=labels.device)
-    padding[-labels.size(0):] = labels
-    return torch.nn.functional.cross_entropy(logits, padding, ignore_index=-100)
+    batch, seq_len, vocab = logits.shape
+    # Normalize label shape to [batch, seq_len_labels]
+    if labels.dim() == 1:
+        labels = labels.unsqueeze(0)
+    if labels.size(0) != batch:
+        # If a single label sequence is provided, broadcast; otherwise trim
+        labels = labels.expand(batch, -1) if labels.size(0) == 1 else labels[:batch]
+
+    target_len = min(seq_len, labels.size(1))
+    aligned = torch.full(
+        (batch, seq_len),
+        -100,
+        device=logits.device,
+        dtype=torch.long
+    )
+    aligned[:, :target_len] = labels[:, :target_len].to(torch.long)
+
+    logits_flat = logits.view(-1, vocab)
+    labels_flat = aligned.view(-1)
+    return torch.nn.functional.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
 
 
 def train_per_layer_vectors(

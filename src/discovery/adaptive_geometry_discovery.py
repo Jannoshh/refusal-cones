@@ -34,6 +34,12 @@ class GeometryConfig:
     # GP (if using sklearn/gpytorch)
     kernel_type: str = 'rbf'  # 'rbf', 'linear', or 'rbf+linear'
     kernel_lengthscale: float = 1.0
+    use_sparse_gp: bool = False
+    num_inducing: int = 64
+    sparse_train_steps: int = 15
+    sparse_lr: float = 0.05
+    sparse_max_train_points: int = 256
+    sparse_jitter: float = 1e-5
 
     # Stopping
     convergence_threshold: float = 0.01
@@ -157,6 +163,168 @@ class SimpleGP:
         return K
 
 
+class AdaptiveSparseGP:
+    """
+    Variationally updated sparse GP with learnable inducing points.
+
+    Uses a low-rank Nyström feature map with a ridge-regression objective
+    to adapt inducing locations toward informative regions. This keeps
+    uncertainty estimates while scaling beyond dense GP costs.
+    """
+
+    def __init__(
+        self,
+        kernel_type='rbf',
+        lengthscale: float = 1.0,
+        noise_var: float = 0.01,
+        num_inducing: int = 64,
+        train_steps: int = 15,
+        lr: float = 0.05,
+        max_train_points: int = 256,
+        jitter: float = 1e-5
+    ):
+        self.kernel_type = kernel_type
+        self.noise_var = noise_var
+        self.train_steps = train_steps
+        self.lr = lr
+        self.max_train_points = max_train_points
+        self.jitter = jitter
+        self.num_inducing = num_inducing
+
+        # Learnable parameters
+        self.log_lengthscale = torch.tensor(float(lengthscale)).log().requires_grad_()
+        self.inducing_points = None
+
+        # Cached fit state
+        self.w = None
+        self.A_inv = None
+        self.L_mm = None
+
+    @property
+    def lengthscale(self):
+        return torch.nn.functional.softplus(self.log_lengthscale) + 1e-6
+
+    def _kernel(self, V1: torch.Tensor, V2: torch.Tensor) -> torch.Tensor:
+        if self.kernel_type == 'rbf':
+            # RBF kernel on flattened vectors
+            dots = V1 @ V2.T
+            dots = torch.clamp(dots, -1, 1)
+            dist_sq = 2 * (1 - dots)  # chord distance proxy
+            K = torch.exp(-dist_sq / (2 * self.lengthscale ** 2))
+        elif self.kernel_type == 'linear':
+            K = V1 @ V2.T
+        else:
+            raise ValueError(f"Unknown kernel: {self.kernel_type}")
+        return K
+
+    def _ensure_inducing(self, V: torch.Tensor, m: int):
+        if self.inducing_points is None or self.inducing_points.shape[0] != m:
+            # Initialize or resize with random subset (or all if small)
+            idx = torch.randperm(len(V))[:m]
+            init = V[idx].detach().clone()
+            self.inducing_points = torch.nn.Parameter(init)
+
+    def fit(self, V: torch.Tensor, R: torch.Tensor):
+        """
+        Fit sparse GP with adaptive inducing points.
+
+        Args:
+            V: Observed directions [n, d]
+            R: Observed refusal strengths [n]
+        """
+        if V.dim() != 2:
+            raise ValueError("V must be [n, d] flattened directions")
+
+        device = V.device
+        V_train = V[-self.max_train_points:].to(device)
+        R_train = R[-self.max_train_points:].to(device)
+
+        m = min(self.num_inducing, len(V_train))
+        self._ensure_inducing(V_train, m)
+
+        params = [self.inducing_points, self.log_lengthscale]
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+
+        for _ in range(self.train_steps):
+            optimizer.zero_grad()
+
+            Z = self.inducing_points
+            K_mm = self._kernel(Z, Z) + self.jitter * torch.eye(len(Z), device=device)
+            L_mm = torch.linalg.cholesky(K_mm)
+
+            K_nm = self._kernel(V_train, Z)  # [n, m]
+            # Φ = K_nm K_mm^{-1/2}
+            tmp = torch.triangular_solve(K_nm.T, L_mm, upper=False).solution  # [m, n]
+            phi = tmp.T  # [n, m]
+
+            lambda_ = self.noise_var
+            A = phi.T @ phi + lambda_ * torch.eye(len(Z), device=device)
+            A = A + self.jitter * torch.eye(len(Z), device=device)
+            L_A = torch.linalg.cholesky(A)
+
+            rhs = phi.T @ R_train
+            w = torch.cholesky_solve(rhs.unsqueeze(-1), L_A).squeeze(-1)
+
+            pred = phi @ w
+            residual = R_train - pred
+
+            data_loss = (residual ** 2).mean()
+            reg_loss = lambda_ * (w ** 2).mean()
+            logdet = 2 * torch.log(torch.diag(L_A) + 1e-12).sum() / len(R_train)
+
+            loss = data_loss + reg_loss + 1e-3 * logdet
+            loss.backward()
+            optimizer.step()
+
+        # Cache final state for prediction
+        with torch.no_grad():
+            Z = self.inducing_points
+            K_mm = self._kernel(Z, Z) + self.jitter * torch.eye(len(Z), device=device)
+            self.L_mm = torch.linalg.cholesky(K_mm)
+
+            K_nm = self._kernel(V_train, Z)
+            tmp = torch.triangular_solve(K_nm.T, self.L_mm, upper=False).solution
+            phi = tmp.T
+
+            A = phi.T @ phi + self.noise_var * torch.eye(len(Z), device=device)
+            A = A + self.jitter * torch.eye(len(Z), device=device)
+            L_A = torch.linalg.cholesky(A)
+            self.A_inv = torch.cholesky_inverse(L_A)
+
+            rhs = phi.T @ R_train
+            self.w = torch.cholesky_solve(rhs.unsqueeze(-1), L_A).squeeze(-1)
+
+    def predict(self, V_test: torch.Tensor) -> tuple:
+        """
+        Predict mean and std for test directions.
+
+        Args:
+            V_test: [m, d] flattened directions
+        """
+        if self.inducing_points is None or self.w is None:
+            mean = torch.zeros(len(V_test), device=V_test.device)
+            std = torch.ones(len(V_test), device=V_test.device)
+            return mean, std
+
+        device = self.inducing_points.device
+        Vt = V_test.to(device)
+
+        K_sm = self._kernel(Vt, self.inducing_points)  # [m, M]
+        # Φ_* = K_sm K_mm^{-1/2}
+        tmp = torch.triangular_solve(K_sm.T, self.L_mm, upper=False).solution
+        phi_star = tmp.T  # [m, M]
+
+        mean = phi_star @ self.w
+
+        # Predictive variance: λ + φ_* A^{-1} φ_*^T (diagonal only)
+        A_inv_phiT = phi_star @ self.A_inv  # [m, M]
+        var = self.noise_var + (A_inv_phiT * phi_star).sum(dim=1)
+        var = torch.clamp(var, min=self.jitter)
+        std = torch.sqrt(var)
+
+        return mean, std
+
+
 class RefusalGeometryDiscovery:
     """
     Discover the geometry of refusal subspace adaptively.
@@ -193,10 +361,21 @@ class RefusalGeometryDiscovery:
         self.R_observed = []
 
         # GP model
-        self.gp = SimpleGP(
-            kernel_type=self.config.kernel_type,
-            lengthscale=self.config.kernel_lengthscale
-        )
+        if self.config.use_sparse_gp:
+            self.gp = AdaptiveSparseGP(
+                kernel_type=self.config.kernel_type,
+                lengthscale=self.config.kernel_lengthscale,
+                num_inducing=self.config.num_inducing,
+                train_steps=self.config.sparse_train_steps,
+                lr=self.config.sparse_lr,
+                max_train_points=self.config.sparse_max_train_points,
+                jitter=self.config.sparse_jitter
+            )
+        else:
+            self.gp = SimpleGP(
+                kernel_type=self.config.kernel_type,
+                lengthscale=self.config.kernel_lengthscale
+            )
 
     def discover(self) -> Dict:
         """
@@ -405,7 +584,11 @@ class RefusalGeometryDiscovery:
         top_k = min(5, len(R_observed))
         topk_values, topk_indices = R_observed.topk(top_k)
 
-        principal_dirs = [V_observed[idx] for idx in topk_indices if topk_values[topk_indices == idx] > self.config.boundary_threshold]
+        principal_dirs = [
+            V_observed[idx]
+            for idx, value in zip(topk_indices, topk_values)
+            if value > self.config.boundary_threshold
+        ]
 
         return principal_dirs
 

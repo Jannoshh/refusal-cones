@@ -18,7 +18,11 @@ import numpy as np
 from typing import Callable, List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
-from .adaptive_geometry_discovery import SimpleGP, GeometryConfig
+from .adaptive_geometry_discovery import (
+    SimpleGP,
+    GeometryConfig,
+    AdaptiveSparseGP
+)
 
 
 @dataclass
@@ -45,6 +49,13 @@ class GradientDiscoveryConfig:
     beta: float = 2.0
     new_mode_threshold: float = 0.7  # Min R to consider as mode
     mode_distance_threshold: float = 0.3  # Min distance between modes
+    kernel_lengthscale: float = 0.3
+    use_sparse_gp: bool = False
+    num_inducing: int = 64
+    sparse_train_steps: int = 10
+    sparse_lr: float = 0.05
+    sparse_max_train_points: int = 256
+    sparse_jitter: float = 1e-5
 
 
 def sample_von_mises_fisher(
@@ -194,7 +205,18 @@ class GradientGeometryDiscovery:
         self.R_observed = []
 
         # GP
-        self.gp = SimpleGP(kernel_type='rbf', lengthscale=0.3)
+        if self.config.use_sparse_gp:
+            self.gp = AdaptiveSparseGP(
+                kernel_type='rbf',
+                lengthscale=self.config.kernel_lengthscale,
+                num_inducing=self.config.num_inducing,
+                train_steps=self.config.sparse_train_steps,
+                lr=self.config.sparse_lr,
+                max_train_points=self.config.sparse_max_train_points,
+                jitter=self.config.sparse_jitter
+            )
+        else:
+            self.gp = SimpleGP(kernel_type='rbf', lengthscale=self.config.kernel_lengthscale)
 
     def discover(self) -> Dict:
         """
@@ -255,9 +277,10 @@ class GradientGeometryDiscovery:
                 n_samples=500
             )
 
-            # GP-UCB acquisition
+            # GP-UCB acquisition (flatten candidates to match GP training shape)
             self._update_gp()
-            mu, sigma = self.gp.predict(torch.stack(candidates))
+            candidate_tensor = torch.stack(candidates)
+            mu, sigma = self.gp.predict(candidate_tensor.reshape(len(candidates), -1))
             ucb = mu + self.config.beta * sigma
 
             # Select best candidate
@@ -316,9 +339,10 @@ class GradientGeometryDiscovery:
                 for i, c in enumerate(candidates):
                     candidates[i] = c / c.norm(dim=1, keepdim=True)
 
-                # GP-UCB with high exploration
+                # GP-UCB with high exploration (flatten candidates)
                 self._update_gp()
-                mu, sigma = self.gp.predict(torch.stack(candidates))
+                candidate_tensor = torch.stack(candidates)
+                mu, sigma = self.gp.predict(candidate_tensor.reshape(len(candidates), -1))
                 ucb = mu + self.config.global_beta * sigma
 
                 # Select best
@@ -519,7 +543,7 @@ def demo_gradient_vs_pure_gp():
     print("Method 2: Pure GP (no gradients, random start)")
     print("=" * 70)
 
-    from adaptive_geometry_discovery import RefusalGeometryDiscovery, GeometryConfig
+    from .adaptive_geometry_discovery import RefusalGeometryDiscovery, GeometryConfig
 
     # Measure function WITHOUT gradients
     def measure_no_grad(v: torch.Tensor) -> float:
