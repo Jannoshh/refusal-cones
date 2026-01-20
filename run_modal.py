@@ -100,33 +100,44 @@ __all__ = [
 ]
 
 
-def download_results(timestamp: str, prefix: str = "single_vector") -> None:
-    """Download results from Modal volume to local results/ directory."""
+def download_results(timestamp: str, prefix: str = "single_vector") -> str:
+    """Download results from Modal volume to organized local directory.
+
+    Creates results/{prefix}_{timestamp}/ with:
+        - results.json
+        - vectors.pt
+        - plot.png
+
+    Returns the local directory path.
+    """
     import os
     import subprocess
 
-    # Create local results directory
-    os.makedirs("results", exist_ok=True)
+    # Create organized directory
+    run_dir = f"results/{prefix}_{timestamp}"
+    os.makedirs(run_dir, exist_ok=True)
 
-    # Files to download
-    files = [
-        f"{prefix}_{timestamp}.json",
-        f"{prefix}_vecs_{timestamp}.pt",
-        f"{prefix}_plot_{timestamp}.png",
-    ]
+    # Map remote filenames to clean local names
+    file_mapping = {
+        f"{prefix}_{timestamp}.json": "results.json",
+        f"{prefix}_vecs_{timestamp}.pt": "vectors.pt",
+        f"{prefix}_plot_{timestamp}.png": "plot.png",
+    }
 
-    print("\nDownloading results...")
-    for filename in files:
-        local_path = f"results/{filename}"
+    print(f"\nDownloading results to {run_dir}/")
+    for remote_name, local_name in file_mapping.items():
+        local_path = f"{run_dir}/{local_name}"
         try:
             subprocess.run(
-                ["modal", "volume", "get", "refusal-cones-results", filename, local_path],
+                ["modal", "volume", "get", "refusal-cones-results", remote_name, local_path],
                 check=True,
                 capture_output=True,
             )
-            print(f"  Downloaded: {local_path}")
+            print(f"  {local_name}")
         except subprocess.CalledProcessError:
-            print(f"  Not found: {filename}")
+            print(f"  {local_name} (not found)")
+
+    return run_dir
 
 
 @app.local_entrypoint()
@@ -152,7 +163,7 @@ def main() -> None:
     print(f"  Pareto vectors: {results['n_pareto']}")
     print(f"  Hypervolume: {results['hypervolume']:.4f}")
 
-    # Download results
-    download_results(results["timestamp"], prefix="single_vector")
+    # Download results to organized directory
+    run_dir = download_results(results["timestamp"], prefix="single_vector")
 
-    print("\nResults saved to results/ directory")
+    print(f"\nResults saved to {run_dir}/")
