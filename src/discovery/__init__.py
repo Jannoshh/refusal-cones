@@ -20,7 +20,24 @@ from .pareto_boundary_discovery import (
     ParetoDiscoveryConfig,
     ParetoDiscoveryResults,
     MultiObjectiveScorer,
-    discover_pareto_boundary
+    discover_pareto_boundary,
+    BoundaryThenParetoDiscovery,
+    BoundaryThenParetoConfig,
+    BoundaryThenParetoResults
+)
+from .single_layer_discovery import (
+    SingleLayerDiscovery,
+    SingleLayerDiscoveryConfig,
+    SingleLayerDiscoveryResults,
+    PerLayerResults,
+    DirectionLayerGP
+)
+from .single_vector_discovery import (
+    SingleVectorDiscovery,
+    SingleVectorDiscoveryConfig,
+    SingleVectorResults,
+    SingleVectorScorer,
+    SingleVectorGP
 )
 
 __all__ = [
@@ -38,4 +55,17 @@ __all__ = [
     'ParetoDiscoveryResults',
     'MultiObjectiveScorer',
     'discover_pareto_boundary',
+    'BoundaryThenParetoDiscovery',
+    'BoundaryThenParetoConfig',
+    'BoundaryThenParetoResults',
+    'SingleLayerDiscovery',
+    'SingleLayerDiscoveryConfig',
+    'SingleLayerDiscoveryResults',
+    'PerLayerResults',
+    'DirectionLayerGP',
+    'SingleVectorDiscovery',
+    'SingleVectorDiscoveryConfig',
+    'SingleVectorResults',
+    'SingleVectorScorer',
+    'SingleVectorGP',
 ]
