@@ -100,26 +100,59 @@ __all__ = [
 ]
 
 
+def download_results(timestamp: str, prefix: str = "single_vector") -> None:
+    """Download results from Modal volume to local results/ directory."""
+    import os
+    import subprocess
+
+    # Create local results directory
+    os.makedirs("results", exist_ok=True)
+
+    # Files to download
+    files = [
+        f"{prefix}_{timestamp}.json",
+        f"{prefix}_vecs_{timestamp}.pt",
+        f"{prefix}_plot_{timestamp}.png",
+    ]
+
+    print("\nDownloading results...")
+    for filename in files:
+        local_path = f"results/{filename}"
+        try:
+            subprocess.run(
+                ["modal", "volume", "get", "refusal-cones-results", filename, local_path],
+                check=True,
+                capture_output=True,
+            )
+            print(f"  Downloaded: {local_path}")
+        except subprocess.CalledProcessError:
+            print(f"  Not found: {filename}")
+
+
 @app.local_entrypoint()
 def main() -> None:
-    """Local entrypoint for testing."""
-    print("Running Pareto discovery...")
+    """Local entrypoint - runs single-vector discovery and downloads results."""
+    print("Running single-vector discovery...")
     print("View logs at: https://modal.com/apps (select 'refusal-cones')")
-    results = run_pareto_discovery.remote(
-        model="Qwen/Qwen3-0.6B",
+
+    results = run_single_vector_discovery.remote(
+        model="Qwen/Qwen2-1.5B-Instruct",
         n_init_samples=30,
-        n_pareto_iterations=70,
-        max_measurements=150,
+        n_iterations=30,
+        n_harmful=16,
+        n_harmless=16,
     )
-    print("\nPareto discovery complete!")
+
+    print("\n" + "=" * 60)
+    print("SINGLE-VECTOR DISCOVERY COMPLETE")
+    print("=" * 60)
     print(f"  Measurements: {results['n_measurements']}")
-    print(f"  Pareto vectors: {results['n_pareto_vectors']}")
+    print(f"  Best refusal: {results['best_scores']['refusal_score']:.4f}")
+    print(f"  Best KL: {results['best_scores']['kl_score']:.4f}")
+    print(f"  Pareto vectors: {results['n_pareto']}")
     print(f"  Hypervolume: {results['hypervolume']:.4f}")
-    print("\nPareto frontier (refusal_score, kl_score):")
-    for i, (r, k) in enumerate(
-        zip(
-            results["pareto_scores"]["refusal_score"][:5],
-            results["pareto_scores"]["kl_score"][:5],
-        )
-    ):
-        print(f"  {i + 1}. refusal={r:.4f}, kl={k:.4f}")
+
+    # Download results
+    download_results(results["timestamp"], prefix="single_vector")
+
+    print("\nResults saved to results/ directory")
