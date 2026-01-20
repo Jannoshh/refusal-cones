@@ -2,7 +2,7 @@
 
 **Adversarial research project for discovering and manipulating refusal mechanisms in LLMs**
 
-> **Based on:** [The Geometry of Refusal in Large Language Models](papers/The%20Geometry%20of%20Refusal%20in%20Large%20Language%20Models.pdf) (arXiv:2502.17420)
+> **Based on:** [The Geometry of Refusal in Large Language Models](literature/papers/The%20Geometry%20of%20Refusal%20in%20Large%20Language%20Models.pdf) (arXiv:2502.17420)
 
 This repository implements state-of-the-art techniques for:
 1. Discovering the geometric structure of refusal subspaces in language models
@@ -669,7 +669,7 @@ v = v / ||v||                       # Retract to sphere
 
 ### 5. Affine Concept Editing (ACE)
 
-Based on ["Refusal in LLMs is an Affine Function"](papers/affine_refusal.pdf) (Marshall et al., 2024), we implement the ACE formula for ablation:
+Based on ["Refusal in LLMs is an Affine Function"](literature/papers/affine_refusal.pdf) (Marshall et al., 2024), we implement the ACE formula for ablation:
 
 ```
 h' = h - proj_v(h) + proj_v(v⁻) + α*v
