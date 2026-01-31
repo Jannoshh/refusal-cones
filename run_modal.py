@@ -23,6 +23,9 @@ Usage:
     # Run single-vector discovery (simplest approach)
     modal run modal_app.py::run_single_vector_discovery --model "Qwen/Qwen2-1.5B-Instruct"
 
+    # Run SOM ACE vs Linear comparison (on A100)
+    modal run run_modal.py::run_som_comparison --model qwen2-1.5b
+
     # Deploy as serverless endpoint
     modal deploy modal_app.py
 
@@ -35,6 +38,7 @@ The actual implementations are in:
 - modal_app/pareto.py - Pareto-based discovery
 - modal_app/boundary.py - Boundary-based discovery
 - modal_app/single_layer.py - Single-layer discovery and testing
+- modal_app/som_comparison.py - SOM ACE vs Linear comparison
 """
 
 # Import everything from the package
@@ -66,6 +70,8 @@ from modal_app import (
     run_single_layer_discovery,
     run_single_vector_discovery,
     test_single_layer_refusal,
+    # SOM comparison
+    run_som_comparison,
 )
 
 # Re-export for backwards compatibility
@@ -97,6 +103,8 @@ __all__ = [
     "run_single_layer_discovery",
     "run_single_vector_discovery",
     "test_single_layer_refusal",
+    # SOM comparison
+    "run_som_comparison",
 ]
 
 

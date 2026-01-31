@@ -357,6 +357,249 @@ class SingleVectorScorer:
 
         return directions
 
+    def compute_losses_with_grad(
+        self,
+        v: torch.Tensor,
+        harmful_completions: Optional[List[str]] = None,
+        harmless_completions: Optional[List[str]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        """
+        Compute differentiable ablate and retain losses.
+
+        Ablate loss: CE on harmful completions with ablation (lower = model complies)
+        Retain loss: CE on harmless completions with ablation (lower = model stays helpful)
+
+        Args:
+            v: [hidden_dim] direction vector (requires_grad should be True)
+            harmful_completions: Target completions for harmful prompts (default: "Sure")
+            harmless_completions: Target completions for harmless prompts (default: use prompt continuation)
+
+        Returns:
+            ablate_loss: Scalar tensor (harmful prompt CE, with gradient)
+            retain_loss: Scalar tensor (harmless prompt CE, with gradient)
+            metrics: Dict with detached scalar values
+        """
+        self.compute_baselines()
+
+        v = v.to(self.device)
+        v_norm = v / (v.norm() + 1e-8)
+
+        # Default completions
+        if harmful_completions is None:
+            harmful_completions = ["Sure"] * len(self.harmful_prompts)
+        if harmless_completions is None:
+            harmless_completions = ["Sure"] * len(self.harmless_prompts)
+
+        # Compute ablate loss (harmful prompts with ablation)
+        ablate_loss = torch.tensor(0.0, device=self.device)
+        ablate_losses = []
+
+        for prompt, completion in zip(self.harmful_prompts, harmful_completions):
+            loss = self._compute_completion_loss_with_ablation(
+                prompt, completion, v_norm
+            )
+            ablate_loss = ablate_loss + loss
+            ablate_losses.append(loss.detach().item())
+
+        ablate_loss = ablate_loss / len(self.harmful_prompts)
+
+        # Compute retain loss (harmless prompts with ablation)
+        retain_loss = torch.tensor(0.0, device=self.device)
+        retain_losses = []
+
+        for prompt, completion in zip(self.harmless_prompts, harmless_completions):
+            loss = self._compute_completion_loss_with_ablation(
+                prompt, completion, v_norm
+            )
+            retain_loss = retain_loss + loss
+            retain_losses.append(loss.detach().item())
+
+        retain_loss = retain_loss / len(self.harmless_prompts)
+
+        metrics = {
+            'ablate_loss': ablate_loss.detach().item(),
+            'retain_loss': retain_loss.detach().item(),
+            'mean_harmful_ce': sum(ablate_losses) / len(ablate_losses),
+            'mean_harmless_ce': sum(retain_losses) / len(retain_losses),
+        }
+
+        return ablate_loss, retain_loss, metrics
+
+    def _compute_completion_loss_with_ablation(
+        self,
+        prompt: str,
+        completion: str,
+        v_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute cross-entropy loss on completion with v ablated at all layers."""
+        # Format prompt
+        if self.tokenizer.chat_template is not None:
+            formatted = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        else:
+            formatted = prompt
+
+        # Tokenize prompt + completion
+        full_text = formatted + completion
+        inputs = self.tokenizer(full_text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = inputs.to(self.device)
+
+        # Get prompt length to know where completion starts
+        prompt_inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True, max_length=512)
+        prompt_len = prompt_inputs.input_ids.shape[1]
+
+        # Register ACE hooks
+        hooks = []
+        for layer_idx in self.layers:
+            baseline = self._v_minus[layer_idx].detach()
+            hooks.append(
+                self.layer_modules[layer_idx].register_forward_hook(
+                    self._make_ace_hook_differentiable(v_norm, baseline)
+                )
+            )
+
+        # Forward pass
+        outputs = self.model(**inputs)
+        logits = outputs.logits  # [1, seq_len, vocab]
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        # Compute CE loss only on completion tokens
+        # Shift: predict token i+1 from position i
+        if prompt_len >= inputs.input_ids.shape[1]:
+            # Completion is empty or truncated, return high loss
+            return torch.tensor(10.0, device=self.device, requires_grad=True)
+
+        shift_logits = logits[:, prompt_len-1:-1, :]  # Predict completion tokens
+        shift_labels = inputs.input_ids[:, prompt_len:]  # Completion token IDs
+
+        loss = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            reduction='mean'
+        )
+
+        return loss
+
+    def _make_ace_hook_differentiable(self, v_norm: torch.Tensor, baseline: torch.Tensor):
+        """Create ACE ablation hook that preserves gradients."""
+        def hook(module, input, output):
+            h = output[0] if isinstance(output, tuple) else output
+
+            # Project out v from h (keeps gradient flow through v_norm)
+            proj_h = torch.einsum('...d,d->...', h, v_norm)
+
+            # Project baseline onto v
+            proj_baseline = torch.einsum('d,d->', baseline, v_norm)
+
+            # ACE: h' = h - proj_v(h) + proj_v(baseline)
+            h_ablated = h - torch.einsum('...,d->...d', proj_h, v_norm) + proj_baseline * v_norm
+
+            if isinstance(output, tuple):
+                return (h_ablated,) + output[1:]
+            return h_ablated
+
+        return hook
+
+    def gradient_step(
+        self,
+        v: torch.Tensor,
+        lr: float = 0.1,
+        lambda_retain: float = 0.1,
+        harmful_completions: Optional[List[str]] = None,
+        harmless_completions: Optional[List[str]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Take one gradient step to improve v.
+
+        Minimizes: ablate_loss + lambda_retain * retain_loss
+
+        Uses Riemannian gradient descent on the unit sphere.
+
+        Args:
+            v: Current direction [hidden_dim]
+            lr: Learning rate
+            lambda_retain: Weight for retain loss
+            harmful_completions: Target completions for harmful prompts
+            harmless_completions: Target completions for harmless prompts
+
+        Returns:
+            v_new: Updated direction (normalized)
+            metrics: Loss values
+        """
+        v = v.clone().detach().to(self.device)
+        v.requires_grad = True
+
+        # Compute losses
+        ablate_loss, retain_loss, metrics = self.compute_losses_with_grad(
+            v, harmful_completions, harmless_completions
+        )
+
+        # Combined loss
+        total_loss = ablate_loss + lambda_retain * retain_loss
+        metrics['total_loss'] = total_loss.detach().item()
+
+        # Backward
+        total_loss.backward()
+
+        # Riemannian gradient (project to tangent space of sphere)
+        grad = v.grad
+        v_norm = v / (v.norm() + 1e-8)
+        grad_tangent = grad - torch.dot(grad, v_norm) * v_norm
+
+        # Update
+        v_new = v.detach() - lr * grad_tangent
+
+        # Project back to sphere
+        v_new = v_new / (v_new.norm() + 1e-8)
+
+        return v_new, metrics
+
+    def refine_with_gradient(
+        self,
+        v: torch.Tensor,
+        n_steps: int = 5,
+        lr: float = 0.1,
+        lambda_retain: float = 0.1,
+        harmful_completions: Optional[List[str]] = None,
+        harmless_completions: Optional[List[str]] = None,
+        verbose: bool = False,
+    ) -> Tuple[torch.Tensor, List[Dict[str, float]]]:
+        """
+        Refine a direction using gradient descent.
+
+        Args:
+            v: Initial direction
+            n_steps: Number of gradient steps
+            lr: Learning rate
+            lambda_retain: Weight for retain loss
+            verbose: Print progress
+
+        Returns:
+            v_refined: Improved direction
+            history: List of metrics per step
+        """
+        history = []
+        v_current = v.clone()
+
+        for step in range(n_steps):
+            v_current, metrics = self.gradient_step(
+                v_current, lr, lambda_retain,
+                harmful_completions, harmless_completions
+            )
+            history.append(metrics)
+
+            if verbose:
+                print(f"    Step {step+1}: ablate={metrics['ablate_loss']:.4f}, "
+                      f"retain={metrics['retain_loss']:.4f}")
+
+        return v_current, history
+
 
 class SingleVectorGP:
     """Simple GP for optimization on the unit sphere in R^d."""
@@ -461,14 +704,24 @@ class SingleVectorDiscovery:
         self.V_observed = []
         self.scores_observed = {'refusal_score': [], 'kl_score': []}
 
-    def discover(self) -> SingleVectorResults:
-        """Run discovery to find optimal single vector."""
+    def discover(
+        self,
+        harmful_completions: Optional[List[str]] = None,
+        harmless_completions: Optional[List[str]] = None,
+    ) -> SingleVectorResults:
+        """Run discovery to find optimal single vector.
+
+        Args:
+            harmful_completions: Target completions for harmful prompts (for gradient refinement)
+            harmless_completions: Target completions for harmless prompts (for gradient refinement)
+        """
         print(f"\n{'='*60}")
         print("SINGLE-VECTOR DISCOVERY")
         print(f"{'='*60}")
         print(f"Hidden dim: {self.hidden_dim}")
         print(f"Init samples: {self.config.n_init_samples}")
         print(f"Iterations: {self.config.n_iterations}")
+        print(f"Gradient refinement: {self.config.use_gradient_refinement}")
 
         # Compute dynamic threshold if needed
         if self.config.use_boundary_search and self.config.boundary_threshold is None:
@@ -500,6 +753,35 @@ class SingleVectorDiscovery:
         self._add_observation(v_init_norm, scores)
         print(f"  mean-diff: refusal={scores['refusal_score']:.4f}")
 
+        # Gradient-based refinement of promising r_i directions
+        if self.config.use_gradient_refinement:
+            print(f"\nGradient refinement of top r_i directions...")
+            # Find top-k r_i by refusal score
+            n_refine = min(5, len(r_directions))
+            r_i_scores = [(i, self.scores_observed['refusal_score'][i])
+                          for i in range(len(r_directions))]
+            r_i_scores.sort(key=lambda x: x[1])  # Sort by refusal (lower = better)
+
+            for rank, (idx, _) in enumerate(r_i_scores[:n_refine]):
+                v_start = self.V_observed[idx]
+                print(f"  Refining r_{idx} (rank {rank+1})...")
+
+                v_refined, history = self.scorer.refine_with_gradient(
+                    v_start,
+                    n_steps=self.config.gradient_steps,
+                    lr=self.config.gradient_lr,
+                    lambda_retain=0.1,
+                    harmful_completions=harmful_completions,
+                    harmless_completions=harmless_completions,
+                    verbose=False,
+                )
+
+                # Evaluate refined vector
+                scores = self.scorer.score(v_refined)
+                self._add_observation(v_refined, scores)
+                print(f"    Before: refusal={self.scores_observed['refusal_score'][idx]:.4f}")
+                print(f"    After:  refusal={scores['refusal_score']:.4f}")
+
         # Additional random samples if needed
         n_additional = max(0, self.config.n_init_samples - len(r_directions) - 1)
         if n_additional > 0:
@@ -512,10 +794,10 @@ class SingleVectorDiscovery:
                 scores = self.scorer.score(v)
                 self._add_observation(v, scores)
 
-        # GP-guided optimization
-        print(f"\nGP-guided optimization ({self.config.n_iterations} iterations)...")
+        # Gradient-guided optimization (replaces pure GP)
+        print(f"\nGradient-guided optimization ({self.config.n_iterations} iterations)...")
         for i in range(self.config.n_iterations):
-            # Generate candidates
+            # Generate candidates using GP
             candidates = self._generate_candidates()
 
             # Select best by UCB
@@ -529,6 +811,19 @@ class SingleVectorDiscovery:
                 if ucb > best_ucb:
                     best_ucb = ucb
                     best_v = v
+
+            # Optionally refine with gradient before evaluating
+            if self.config.use_gradient_refinement and (i + 1) % 5 == 0:
+                # Every 5th iteration, do gradient refinement
+                best_v, _ = self.scorer.refine_with_gradient(
+                    best_v,
+                    n_steps=self.config.gradient_steps,
+                    lr=self.config.gradient_lr,
+                    lambda_retain=0.1,
+                    harmful_completions=harmful_completions,
+                    harmless_completions=harmless_completions,
+                    verbose=False,
+                )
 
             # Evaluate
             scores = self.scorer.score(best_v)
@@ -641,6 +936,144 @@ class SingleVectorDiscovery:
                 pareto.append(i)
 
         return pareto
+
+    def explore_pareto_with_gradient(
+        self,
+        v_start: torch.Tensor,
+        lambda_values: List[float] = None,
+        n_steps: int = 10,
+        lr: float = 0.1,
+        harmful_completions: Optional[List[str]] = None,
+        harmless_completions: Optional[List[str]] = None,
+    ) -> List[Tuple[torch.Tensor, Dict[str, float]]]:
+        """
+        Explore Pareto frontier by optimizing with different lambda_retain values.
+
+        Each lambda gives a different trade-off point on the Pareto frontier:
+        - lambda=0: Pure ablation (minimize ablate_loss only)
+        - lambda=1: Equal weight
+        - lambda=10: Prioritize retain (preserve capabilities)
+
+        Args:
+            v_start: Starting direction
+            lambda_values: List of lambda_retain values to try
+            n_steps: Gradient steps per lambda
+            lr: Learning rate
+            harmful_completions: Target completions for harmful prompts
+            harmless_completions: Target completions for harmless prompts
+
+        Returns:
+            List of (vector, scores) tuples along the Pareto frontier
+        """
+        if lambda_values is None:
+            lambda_values = [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0]
+
+        results = []
+        print(f"\nExploring Pareto frontier with {len(lambda_values)} lambda values...")
+
+        for lam in lambda_values:
+            v_refined, history = self.scorer.refine_with_gradient(
+                v_start,
+                n_steps=n_steps,
+                lr=lr,
+                lambda_retain=lam,
+                harmful_completions=harmful_completions,
+                harmless_completions=harmless_completions,
+                verbose=False,
+            )
+
+            # Evaluate with standard scoring
+            scores = self.scorer.score(v_refined)
+            self._add_observation(v_refined, scores)
+
+            results.append((v_refined, scores))
+            print(f"  lambda={lam:.2f}: refusal={scores['refusal_score']:.4f}, "
+                  f"kl={scores['kl_score']:.4f}")
+
+        return results
+
+    def find_boundary_with_gradient(
+        self,
+        v_good: torch.Tensor,
+        v_bad: torch.Tensor,
+        n_steps: int = 20,
+        lr: float = 0.05,
+        harmful_completions: Optional[List[str]] = None,
+        harmless_completions: Optional[List[str]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Find the boundary between good and bad regions using gradient.
+
+        Starts from a point between v_good (works) and v_bad (doesn't work),
+        and uses gradients to find where the transition happens.
+
+        Args:
+            v_good: Direction that successfully ablates refusal
+            v_bad: Direction that doesn't work well
+            n_steps: Number of refinement steps
+            lr: Learning rate
+            harmful_completions: Target completions for harmful prompts
+            harmless_completions: Target completions for harmless prompts
+
+        Returns:
+            boundary_v: Direction near the boundary
+            scores: Scores at that point
+        """
+        # Interpolate to find approximate boundary
+        v_good = v_good / (v_good.norm() + 1e-8)
+        v_bad = v_bad / (v_bad.norm() + 1e-8)
+
+        # Binary search for boundary
+        alpha_low, alpha_high = 0.0, 1.0
+
+        score_good = self.scorer.score(v_good)
+        score_bad = self.scorer.score(v_bad)
+
+        # Threshold: midpoint of scores
+        threshold = (score_good['refusal_score'] + score_bad['refusal_score']) / 2
+
+        for _ in range(10):  # Binary search iterations
+            alpha_mid = (alpha_low + alpha_high) / 2
+            v_mid = alpha_mid * v_bad + (1 - alpha_mid) * v_good
+            v_mid = v_mid / (v_mid.norm() + 1e-8)
+
+            score_mid = self.scorer.score(v_mid)
+
+            if score_mid['refusal_score'] < threshold:
+                # Still in good region, move toward bad
+                alpha_low = alpha_mid
+            else:
+                # In bad region, move toward good
+                alpha_high = alpha_mid
+
+        # Refine the boundary point with small gradient steps
+        v_boundary = v_mid
+        for step in range(n_steps):
+            # Compute gradient of ablate loss
+            v_boundary = v_boundary.clone().detach().to(self.scorer.device)
+            v_boundary.requires_grad = True
+
+            ablate_loss, retain_loss, _ = self.scorer.compute_losses_with_grad(
+                v_boundary, harmful_completions, harmless_completions
+            )
+
+            # We want to stay near the boundary - take tiny steps
+            ablate_loss.backward()
+            grad = v_boundary.grad
+
+            # Project to tangent space
+            v_norm = v_boundary / (v_boundary.norm() + 1e-8)
+            grad_tangent = grad - torch.dot(grad, v_norm) * v_norm
+
+            # Small step in direction that reduces ablate_loss
+            v_boundary = v_boundary.detach() - lr * grad_tangent
+            v_boundary = v_boundary / (v_boundary.norm() + 1e-8)
+
+        # Final evaluation
+        scores = self.scorer.score(v_boundary)
+        self._add_observation(v_boundary, scores)
+
+        return v_boundary, scores
 
     def _compute_hypervolume(self, pareto_scores: Dict[str, torch.Tensor]) -> float:
         """Compute hypervolume indicator."""

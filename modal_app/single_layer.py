@@ -579,6 +579,10 @@ def run_single_vector_discovery(
     n_iterations: int = 50,
     n_harmful: int = 16,
     n_harmless: int = 16,
+    # Gradient refinement options
+    use_gradient_refinement: bool = True,
+    gradient_steps: int = 5,
+    gradient_lr: float = 0.1,
 ) -> dict:
     """
     Run single-vector discovery: find ONE direction v that works across all layers.
@@ -588,6 +592,9 @@ def run_single_vector_discovery(
 
     The search space is just R^{hidden_dim} instead of R^{n_layers x hidden_dim}.
     All r_i directions are used as initialization points.
+
+    When use_gradient_refinement=True, promising directions are refined using
+    gradients of the actual ablate_loss and retain_loss.
     """
     import json
     import time
@@ -648,6 +655,10 @@ def run_single_vector_discovery(
         kernel_lengthscale=0.3,
         beta=2.0,
         n_candidates=100,
+        # Gradient refinement
+        use_gradient_refinement=use_gradient_refinement,
+        gradient_steps=gradient_steps,
+        gradient_lr=gradient_lr,
     )
 
     # Run discovery
@@ -658,7 +669,12 @@ def run_single_vector_discovery(
         config=config,
     )
 
-    results = discovery.discover()
+    # Use harmful_targets as completions for gradient refinement
+    # These are the target completions we want the model to generate after ablation
+    results = discovery.discover(
+        harmful_completions=harmful_targets if use_gradient_refinement else None,
+        harmless_completions=None,  # Use default "Sure" for harmless
+    )
     wall_time = time.time() - start_time
 
     # Print summary

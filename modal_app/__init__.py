@@ -67,6 +67,9 @@ from modal_app.single_layer import (
     test_single_layer_refusal,
 )
 
+# SOM comparison functions
+from modal_app.som_comparison import run_som_comparison
+
 __all__ = [
     # Config
     "app",
@@ -99,4 +102,6 @@ __all__ = [
     "run_single_layer_discovery",
     "run_single_vector_discovery",
     "test_single_layer_refusal",
+    # SOM comparison
+    "run_som_comparison",
 ]
