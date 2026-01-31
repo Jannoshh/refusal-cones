@@ -27,7 +27,7 @@ import modal
 from pathlib import Path
 
 # Modal configuration
-GPU_CONFIG = modal.gpu.A10G()
+GPU_CONFIG = "A10G"
 TIMEOUT = 7200  # 2 hours
 
 # Create Modal app
@@ -57,7 +57,7 @@ volume = modal.Volume.from_name("refusal-cones-results", create_if_missing=True)
     gpu=GPU_CONFIG,
     timeout=TIMEOUT,
     volumes={"/results": volume},
-    secrets=[modal.Secret.from_name("my-huggingface-secret", required=False)],
+    secrets=[modal.Secret.from_name("huggingface")],
 )
 def train_with_pareto_objective(
     n_steps: int = 100,
@@ -625,7 +625,7 @@ def train_with_pareto_objective(
     gpu=GPU_CONFIG,
     timeout=TIMEOUT,
     volumes={"/results": volume},
-    secrets=[modal.Secret.from_name("my-huggingface-secret", required=False)],
+    secrets=[modal.Secret.from_name("huggingface")],
 )
 def pareto_sweep():
     """
