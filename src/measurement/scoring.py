@@ -204,7 +204,10 @@ def refusal_score_fn(
     logits = logits.to(torch.float64)
 
     probs = torch.nn.functional.softmax(logits, dim=-1)
-    refusal_probs = probs[:, refusal_toks].sum(dim=-1)
+
+    # Use unique tokens to avoid summing duplicates (which can make refusal_probs > 1)
+    unique_toks = refusal_toks.unique()
+    refusal_probs = probs[:, unique_toks].sum(dim=-1)
 
     nonrefusal_probs = torch.ones_like(refusal_probs) - refusal_probs
     return torch.log(refusal_probs + epsilon) - torch.log(nonrefusal_probs + epsilon)

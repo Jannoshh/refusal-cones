@@ -58,6 +58,199 @@ from dataclasses import dataclass, field
 from .adaptive_geometry_discovery import SimpleGP, AdaptiveSparseGP, StructuredLayerGP
 
 
+class SmoothLayerParameterization:
+    """
+    Parameterize layer vectors v as smooth functions of layer index.
+
+    Instead of optimizing v ∈ R^{n_layers × hidden_dim} directly, we optimize
+    basis coefficients z ∈ R^{n_basis × hidden_dim} where:
+
+        v(layer_i) = Σ_k z_k * φ_k(layer_i)
+
+    and φ_k are RBF basis functions centered at different layers.
+
+    This enforces smoothness by construction:
+    - Adjacent layers automatically have similar directions
+    - Reduces effective dimensionality from n_layers to n_basis
+    - Matches the smoothness prior in StructuredLayerGP
+
+    Theoretical motivation:
+    - If the GP assumes layer smoothness (K_layer[i,j] = exp(-(i-j)²/2σ²)),
+      then optimizing in the span of smooth basis functions ensures we stay
+      in regions where the GP's predictions are reliable.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        hidden_dim: int,
+        n_basis: int = 8,
+        lengthscale: float = 3.0,
+        device: str = 'cpu'
+    ):
+        """
+        Initialize smooth parameterization.
+
+        Args:
+            n_layers: Number of model layers
+            hidden_dim: Hidden dimension per layer
+            n_basis: Number of basis functions (controls expressiveness vs smoothness)
+                     Typical: 6-12 for 28-layer models
+            lengthscale: RBF lengthscale (should match StructuredLayerGP.layer_lengthscale)
+            device: Torch device
+        """
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
+        self.n_basis = n_basis
+        self.lengthscale = lengthscale
+        self.device = device
+
+        # RBF basis centers spread across layers
+        self.centers = torch.linspace(0, n_layers - 1, n_basis, device=device)
+
+        # Precompute basis matrix [n_layers, n_basis]
+        # basis[i, k] = φ_k(layer_i) = exp(-(i - c_k)² / 2σ²)
+        idx = torch.arange(n_layers, dtype=torch.float32, device=device)
+        self.basis = torch.exp(
+            -(idx.unsqueeze(1) - self.centers.unsqueeze(0)) ** 2
+            / (2 * lengthscale ** 2)
+        )
+
+        # Normalize columns so each basis function has unit L2 norm
+        self.basis = self.basis / (self.basis.norm(dim=0, keepdim=True) + 1e-8)
+
+        # Precompute pseudoinverse for v_to_z projection
+        # basis_pinv @ v gives least-squares z
+        self.basis_pinv = torch.linalg.pinv(self.basis)
+
+    def z_to_v(self, z: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+        """
+        Convert basis coefficients to layer vectors.
+
+        Args:
+            z: Basis coefficients [n_basis, hidden_dim]
+            normalize: Whether to normalize result to unit norm
+
+        Returns:
+            v: Layer vectors [n_layers, hidden_dim]
+        """
+        # v = basis @ z: [n_layers, n_basis] @ [n_basis, hidden_dim] -> [n_layers, hidden_dim]
+        # Match dtype of basis to input z
+        z_device = z.to(self.device)
+        v = self.basis.to(z_device.dtype) @ z_device
+
+        if normalize:
+            v = v / (v.norm() + 1e-8)
+
+        return v
+
+    def v_to_z(self, v: torch.Tensor) -> torch.Tensor:
+        """
+        Project layer vectors to basis coefficients (least squares).
+
+        This finds z that minimizes ||basis @ z - v||²
+
+        Args:
+            v: Layer vectors [n_layers, hidden_dim]
+
+        Returns:
+            z: Basis coefficients [n_basis, hidden_dim]
+        """
+        # z = basis_pinv @ v: [n_basis, n_layers] @ [n_layers, hidden_dim] -> [n_basis, hidden_dim]
+        # Match dtype of basis to input v
+        v_device = v.to(self.device)
+        return self.basis_pinv.to(v_device.dtype) @ v_device
+
+    def random_z(self, scale: float = 1.0) -> torch.Tensor:
+        """
+        Sample random basis coefficients.
+
+        Args:
+            scale: Scale of random initialization
+
+        Returns:
+            z: Random coefficients [n_basis, hidden_dim]
+        """
+        z = torch.randn(self.n_basis, self.hidden_dim, device=self.device) * scale
+        return z
+
+    def gradient_z_to_v(
+        self,
+        grad_v: torch.Tensor,
+        z: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Convert gradient w.r.t. v to gradient w.r.t. z via chain rule.
+
+        Since z_to_v normalizes: v = (basis @ z) / ||basis @ z||,
+        the gradient must include the normalization Jacobian.
+
+        Let u = basis @ z (unnormalized), v = u / ||u|| (normalized).
+        The Jacobian of normalization is: ∂v/∂u = (I - vv^T) / ||u||
+
+        So: ∂L/∂u = (∂L/∂v - (∂L/∂v · v) * v) / ||u||
+        And: ∂L/∂z = basis.T @ ∂L/∂u
+
+        Args:
+            grad_v: Gradient w.r.t. v [n_layers, hidden_dim]
+            z: Current basis coefficients [n_basis, hidden_dim] (needed for ||u||)
+            v: Current normalized vector [n_layers, hidden_dim] (for tangent projection)
+               If not provided, computed from z
+
+        Returns:
+            grad_z: Gradient w.r.t. z [n_basis, hidden_dim]
+        """
+        grad_device = grad_v.to(self.device)
+        basis = self.basis.to(grad_device.dtype)
+
+        # If z and v not provided, fall back to simple chain rule (no normalization)
+        # This maintains backward compatibility but is less accurate
+        if z is None:
+            return basis.T @ grad_device
+
+        z_device = z.to(self.device).to(grad_device.dtype)
+
+        # Compute unnormalized vector and its norm
+        u = basis @ z_device  # [n_layers, hidden_dim]
+        u_norm = u.norm() + 1e-8
+
+        # Get normalized v (compute if not provided)
+        if v is None:
+            v = u / u_norm
+        else:
+            v = v.to(self.device).to(grad_device.dtype)
+
+        # Project gradient to tangent space of sphere at v
+        # This is the Jacobian of normalization: (I - vv^T) @ grad_v / ||u||
+        grad_dot_v = (grad_device * v).sum()
+        grad_tangent = (grad_device - grad_dot_v * v) / u_norm
+
+        # Chain rule through basis transformation
+        grad_z = basis.T @ grad_tangent
+
+        return grad_z
+
+    def smoothness_of_v(self, v: torch.Tensor) -> float:
+        """
+        Measure how well v fits the smooth basis (reconstruction error).
+
+        Lower = more smooth (better fit to basis).
+
+        Args:
+            v: Layer vectors [n_layers, hidden_dim]
+
+        Returns:
+            error: Relative reconstruction error
+        """
+        z = self.v_to_z(v)
+        v_reconstructed = self.z_to_v(z, normalize=False)
+
+        # Relative error
+        error = (v - v_reconstructed).norm() / (v.norm() + 1e-8)
+        return error.item()
+
+
 @dataclass
 class ParetoDiscoveryConfig:
     """Configuration for multi-objective Pareto discovery."""
@@ -112,6 +305,11 @@ class ParetoDiscoveryConfig:
     gradient_steps: int = 5  # Number of gradient steps per candidate
     n_gradient_candidates: int = 20  # Number of gradient-based candidates per iteration
     gradient_weight_diversity: int = 5  # Number of different scalarization weights to try
+
+    # Smooth layer parameterization (enforces GP-consistent smoothness)
+    use_smooth_parameterization: bool = True  # Optimize in smooth basis space
+    n_basis: int = 8  # Number of RBF basis functions (6-12 typical for 28 layers)
+    # Note: uses layer_lengthscale from Structured GP settings above
 
 
 @dataclass
@@ -347,10 +545,27 @@ class MultiObjectiveScorer:
 
         return completions
 
+    def _format_prompts(self, prompts: List[str]) -> List[str]:
+        """Apply chat template if available, otherwise return prompts as-is."""
+        if self.tokenizer.chat_template is not None:
+            return [
+                self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                for p in prompts
+            ]
+        return prompts
+
     def _prepare_inputs(self):
         """Pre-tokenize prompts for faster scoring."""
+        # Format prompts with chat template for instruction-tuned models
+        formatted_harmful = self._format_prompts(self.harmful_prompts)
+        formatted_harmless = self._format_prompts(self.harmless_prompts)
+
         self.harmful_inputs = self.tokenizer(
-            self.harmful_prompts,
+            formatted_harmful,
             return_tensors='pt',
             padding=True,
             truncation=True,
@@ -358,7 +573,7 @@ class MultiObjectiveScorer:
         ).to(self.device)
 
         self.harmless_inputs = self.tokenizer(
-            self.harmless_prompts,
+            formatted_harmless,
             return_tensors='pt',
             padding=True,
             truncation=True,
@@ -376,26 +591,30 @@ class MultiObjectiveScorer:
 
     def _prepare_completion_inputs(self):
         """Prepare inputs for multi-token completion scoring."""
-        # Tokenize prompts alone to get prompt lengths
+        # Format prompts with chat template
+        formatted_harmful = self._format_prompts(self.harmful_prompts)
+
+        # Tokenize prompts alone to get prompt lengths (without tensor conversion)
         prompt_encodings = self.tokenizer(
-            self.harmful_prompts,
-            return_tensors='pt',
+            formatted_harmful,
             padding=False,
             truncation=True,
-            max_length=256
+            max_length=256,
+            add_special_tokens=False  # Keep prompt lengths aligned with full-text inputs
         )
         self.prompt_lengths = [len(ids) for ids in prompt_encodings['input_ids']]
 
         # Tokenize prompt + completion together
         full_texts = [
-            p + c for p, c in zip(self.harmful_prompts, self.harmful_completions)
+            p + c for p, c in zip(formatted_harmful, self.harmful_completions)
         ]
         self.harmful_full_inputs = self.tokenizer(
             full_texts,
             return_tensors='pt',
             padding=True,
             truncation=True,
-            max_length=512
+            max_length=512,
+            add_special_tokens=False
         ).to(self.device)
 
         # Create labels for completion tokens only (mask out prompt tokens)
@@ -422,26 +641,30 @@ class MultiObjectiveScorer:
 
     def _prepare_harmless_completion_inputs(self):
         """Prepare inputs for multi-token KL scoring on harmless completions."""
-        # Tokenize prompts alone to get prompt lengths
+        # Format prompts with chat template
+        formatted_harmless = self._format_prompts(self.harmless_prompts)
+
+        # Tokenize prompts alone to get prompt lengths (without tensor conversion)
         prompt_encodings = self.tokenizer(
-            self.harmless_prompts,
-            return_tensors='pt',
+            formatted_harmless,
             padding=False,
             truncation=True,
-            max_length=256
+            max_length=256,
+            add_special_tokens=False
         )
         self.harmless_prompt_lengths = [len(ids) for ids in prompt_encodings['input_ids']]
 
         # Tokenize prompt + completion together
         full_texts = [
-            p + c for p, c in zip(self.harmless_prompts, self.harmless_completions)
+            p + c for p, c in zip(formatted_harmless, self.harmless_completions)
         ]
         self.harmless_full_inputs = self.tokenizer(
             full_texts,
             return_tensors='pt',
             padding=True,
             truncation=True,
-            max_length=512
+            max_length=512,
+            add_special_tokens=False
         ).to(self.device)
 
         # Track which positions are completion tokens (for KL computation)
@@ -498,6 +721,31 @@ class MultiObjectiveScorer:
                 outputs = self.model(**self.harmless_inputs)
                 self.baseline_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs).detach()
                 self.baseline_harmless_full_logits = None
+
+    def compute_baseline_refusal_scores(self) -> Tuple[float, float]:
+        """
+        Compute baseline refusal scores (without any ablation).
+
+        This is used to set dynamic thresholds - the boundary should be where
+        ablation starts to have a meaningful effect, relative to the gap between
+        refusal and non-refusal baselines.
+
+        Returns:
+            Tuple of (harmful_baseline, harmless_baseline):
+            - harmful_baseline: Mean refusal score on harmful prompts (model refuses, positive)
+            - harmless_baseline: Mean refusal score on harmless prompts (model doesn't refuse, negative)
+        """
+        from ..measurement.scoring import refusal_score_fn
+
+        harmful_scores = refusal_score_fn(
+            self.baseline_harmful_logits,
+            self.refusal_toks
+        )
+        harmless_scores = refusal_score_fn(
+            self.baseline_harmless_logits,
+            self.refusal_toks
+        )
+        return harmful_scores.mean().item(), harmless_scores.mean().item()
 
     def compute_mean_diff_vector(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -682,9 +930,13 @@ class MultiObjectiveScorer:
             # Get this layer's refusal direction r
             r_layer = v_per_layer[layer_idx].to(device=self.device, dtype=model_dtype)
 
+            # Skip layers with zero (or near-zero) direction - no ablation needed
+            r_norm = r_layer.norm()
+            if r_norm < 1e-6:
+                continue
+
             # Compute unit vector r̂ = r / ||r||
-            r_norm = r_layer.norm() + 1e-8
-            r_unit = r_layer / r_norm
+            r_unit = r_layer / (r_norm + 1e-8)
 
             # Get reference point v⁻ for this layer (if provided)
             if v_minus is not None:
@@ -717,7 +969,16 @@ class MultiObjectiveScorer:
 
         return handles
 
-    def score(self, v: torch.Tensor, return_grad: bool = False) -> Union[Dict[str, float], Tuple[Dict[str, float], torch.Tensor]]:
+    def _subsample_inputs(self, inputs: dict, n_samples: int) -> dict:
+        """Subsample a batch of tokenized inputs to n_samples."""
+        return {k: v[:n_samples] for k, v in inputs.items()}
+
+    def score(
+        self,
+        v: torch.Tensor,
+        return_grad: bool = False,
+        fidelity: float = 1.0
+    ) -> Union[Dict[str, float], Tuple[Dict[str, float], torch.Tensor]]:
         """
         Compute all objective scores for vector v.
 
@@ -726,6 +987,8 @@ class MultiObjectiveScorer:
         Args:
             v: Direction vector [n_layers, hidden_dim] or [hidden_dim]
             return_grad: Whether to return gradient w.r.t. v
+            fidelity: Fraction of prompts to use (0-1). Lower = faster but noisier.
+                      Use fidelity < 1 for cheap screening, fidelity = 1 for final evaluation.
 
         Returns:
             scores: Dict with 'refusal_score', 'induce_score', 'kl_score'
@@ -746,6 +1009,19 @@ class MultiObjectiveScorer:
         if return_grad:
             v_flat = v_flat.clone().detach().requires_grad_(True)
 
+        # Subsample inputs for low-fidelity evaluation
+        if fidelity < 1.0:
+            n_harmful = max(1, int(len(self.harmful_prompts) * fidelity))
+            n_harmless = max(1, int(len(self.harmless_prompts) * fidelity))
+            harmful_inputs = self._subsample_inputs(self.harmful_inputs, n_harmful)
+            harmless_inputs = self._subsample_inputs(self.harmless_inputs, n_harmless)
+            # Also subsample baseline logits for KL
+            baseline_harmless_logits = self.baseline_harmless_logits[:n_harmless]
+        else:
+            harmful_inputs = self.harmful_inputs
+            harmless_inputs = self.harmless_inputs
+            baseline_harmless_logits = self.baseline_harmless_logits
+
         # Get ACE reference point (cached)
         v_minus = self._ensure_v_minus_cached()
 
@@ -753,70 +1029,66 @@ class MultiObjectiveScorer:
         handles = self._apply_ablation_hooks(v_flat, v_minus=v_minus, alpha=0.0)
 
         try:
-            # === Forward pass 1: Harmful prompts (refusal score or completion loss) ===
+            # === Forward pass 1: Harmful prompts (refusal score) ===
+            # Always compute refusal_score using logit-based method (first token)
+            # This gives consistent scores that can be negative when ablation works
+            if return_grad:
+                outputs = self.model(**harmful_inputs)
+            else:
+                with torch.no_grad():
+                    outputs = self.model(**harmful_inputs)
+
+            ablated_harmful_logits = self._last_nonpad_logits(outputs, harmful_inputs)
+
+            # Refusal score: logit(P_refusal) = log(P_r) - log(1 - P_r)
+            # Negative when ablation works well (e.g., -6 to -14)
+            # Positive when model still refuses (e.g., +5)
+            refusal_logits = refusal_score_fn(
+                ablated_harmful_logits,
+                self.refusal_toks
+            )
+            scores['refusal_score'] = refusal_logits.mean().item()
+
+            # === Optional: Multi-token compliance loss (if completions provided) ===
             if self.harmful_completions is not None:
-                # Multi-token completion scoring
+                # Additional forward pass for multi-token scoring
                 if return_grad:
-                    outputs = self.model(**self.harmful_full_inputs)
+                    outputs_full = self.model(**self.harmful_full_inputs)
                 else:
                     with torch.no_grad():
-                        outputs = self.model(**self.harmful_full_inputs)
+                        outputs_full = self.model(**self.harmful_full_inputs)
 
                 # Compute cross-entropy loss on completion tokens
-                # Shift logits and labels for next-token prediction
-                logits = outputs.logits[:, :-1, :].contiguous()
+                logits = outputs_full.logits[:, :-1, :].contiguous()
                 labels = self.completion_labels[:, 1:].contiguous()
 
-                # Compute per-token loss
                 loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
                 per_token_loss = loss_fct(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1)
                 ).view(logits.size(0), logits.size(1))
 
-                # Average over valid completion tokens per example
                 valid_mask = (labels != -100).float()
                 per_example_loss = (per_token_loss * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)
 
-                # Refusal score: negative loss (lower loss = model complies = lower score)
-                # We want to MINIMIZE refusal_score, so negative loss works
-                # Actually: higher loss = more refusal, lower loss = more compliance
-                # For consistency: refusal_score = loss (high = refusing, low = complying)
-                refusal_logits = per_example_loss
-                scores['refusal_score'] = per_example_loss.mean().item()
-            else:
-                # Original single-token refusal scoring
-                if return_grad:
-                    outputs = self.model(**self.harmful_inputs)
-                else:
-                    with torch.no_grad():
-                        outputs = self.model(**self.harmful_inputs)
-
-                ablated_harmful_logits = self._last_nonpad_logits(outputs, self.harmful_inputs)
-
-                # Refusal score: logit(P_refusal) = log(P_r) - log(1 - P_r)
-                # Negative when ablation works well (e.g., -6)
-                # Uses the proper refusal_score_fn from scoring.py
-                refusal_logits = refusal_score_fn(
-                    ablated_harmful_logits,
-                    self.refusal_toks
-                )
-                scores['refusal_score'] = refusal_logits.mean().item()
+                # ablation_loss (RDO paper): CE loss on harmful completion under ablation
+                # Lower = model generates harmful content more easily = ablation working
+                scores['ablation_loss'] = per_example_loss.mean().item()
 
             # === Forward pass 2: Harmless prompts (KL score + retain loss) ===
             # kl_score: Always single-token at last position (used for GP optimization)
             # retain_loss: Multi-token over completions (for evaluation, if completions provided)
 
             if return_grad:
-                outputs = self.model(**self.harmless_inputs)
+                outputs = self.model(**harmless_inputs)
             else:
                 with torch.no_grad():
-                    outputs = self.model(**self.harmless_inputs)
+                    outputs = self.model(**harmless_inputs)
 
-            ablated_harmless_logits = self._last_nonpad_logits(outputs, self.harmless_inputs)
+            ablated_harmless_logits = self._last_nonpad_logits(outputs, harmless_inputs)
 
             # kl_score: Single-token KL at last position (for GP)
-            log_p_baseline = torch.log_softmax(self.baseline_harmless_logits.float(), dim=-1)
+            log_p_baseline = torch.log_softmax(baseline_harmless_logits.float(), dim=-1)
             log_p_ablated = torch.log_softmax(ablated_harmless_logits.float(), dim=-1)
             p_baseline = log_p_baseline.exp()
             kl = (p_baseline * (log_p_baseline - log_p_ablated)).sum(dim=-1).mean()
@@ -856,9 +1128,14 @@ class MultiObjectiveScorer:
 
             # Compute gradient if requested
             if return_grad:
-                # Combined loss: want refusal_score negative (minimize it)
-                # and kl_score low (minimize it)
-                loss = refusal_logits.mean() + kl
+                # For gradient computation, use CE loss (smooth, differentiable)
+                # NOT the logit-based refusal_score (not good for gradients)
+                if self.harmful_completions is not None:
+                    # Use ablation_loss (CE on completions) for gradient - smooth & differentiable
+                    loss = per_example_loss.mean() + kl
+                else:
+                    # Fallback: use refusal logits (less ideal but works)
+                    loss = refusal_logits.mean() + kl
                 loss.backward()
                 grad = v_flat.grad.clone()
                 return scores, grad.reshape(v.shape)
@@ -917,7 +1194,9 @@ class ParetoGeometryDiscovery:
         self.scores_observed: Dict[str, List[float]] = {
             'refusal_score': [],
             'induce_score': [],
-            'kl_score': []
+            'kl_score': [],
+            'ablation_loss': [],
+            'retain_loss': [],
         }
 
         # One GP per objective
@@ -953,6 +1232,20 @@ class ParetoGeometryDiscovery:
 
         self.gp_type = gp_type
 
+        # Initialize smooth layer parameterization if enabled
+        # Derive device from v_init to avoid device mismatches with scorer
+        if self.config.use_smooth_parameterization:
+            device = self.v_init.device if self.v_init is not None else 'cpu'
+            self.smooth_param = SmoothLayerParameterization(
+                n_layers=n_layers,
+                hidden_dim=hidden_dim,
+                n_basis=self.config.n_basis,
+                lengthscale=self.config.layer_lengthscale,
+                device=device
+            )
+        else:
+            self.smooth_param = None
+
     def discover(self) -> ParetoDiscoveryResults:
         """Run multi-objective Pareto discovery."""
 
@@ -966,6 +1259,11 @@ class ParetoGeometryDiscovery:
             print(f"Candidate generation: GRADIENT-BASED (efficient in {self.n_layers * self.hidden_dim} dims)")
             print(f"  - Gradient steps: {self.config.gradient_steps}, lr: {self.config.gradient_lr}")
             print(f"  - Candidates per iter: {self.config.n_gradient_candidates} gradient + random exploration")
+            if self.config.use_smooth_parameterization:
+                effective_dim = self.config.n_basis * self.hidden_dim
+                full_dim = self.n_layers * self.hidden_dim
+                print(f"  - Smooth parameterization: {self.config.n_basis} basis functions "
+                      f"(effective dim: {effective_dim}, reduction: {full_dim/effective_dim:.1f}x)")
         else:
             print(f"Candidate generation: Random sampling ({self.config.n_candidates} candidates)")
 
@@ -1047,6 +1345,11 @@ class ParetoGeometryDiscovery:
         3. Run gradient descent for a few steps
         4. Return the final points as candidates
 
+        If use_smooth_parameterization is enabled:
+        - Optimize in z-space (basis coefficients) instead of v-space
+        - This enforces layer smoothness consistent with GP prior
+        - Reduces effective dimensionality from n_layers to n_basis
+
         Returns:
             List of candidate vectors
         """
@@ -1080,31 +1383,96 @@ class ParetoGeometryDiscovery:
         # Generate candidates from each starting point with each weight
         n_per_start = max(1, self.config.n_gradient_candidates // len(starting_points))
 
+        # Use smooth parameterization if enabled
+        use_smooth = self.config.use_smooth_parameterization and self.smooth_param is not None
+
+        oom_occurred = False
         for v_start in starting_points[:self.config.n_gradient_candidates]:
+            if oom_occurred:
+                # After OOM, just use perturbations instead of gradients
+                v = v_start + 0.2 * torch.randn_like(v_start)
+                v = self._normalize_vector(v)
+                candidates.append(v.detach().cpu())
+                continue
+
             for w_refusal, w_kl in weights[:n_per_start]:
-                v = v_start.clone()
+                if use_smooth:
+                    # === Smooth parameterization: optimize in z-space ===
+                    # Convert v to basis coefficients z
+                    z = self.smooth_param.v_to_z(v_start)
 
-                # Run gradient descent
-                for step in range(self.config.gradient_steps):
-                    # Get gradient of scalarized objective
-                    # Both objectives are minimized, so we minimize w_r*refusal + w_k*kl
-                    scores, grad = self.scorer.score(v, return_grad=True)
+                    # Run gradient descent in z-space
+                    for step in range(self.config.gradient_steps):
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
 
-                    # The gradient from scorer is for (refusal + kl)
-                    # We want to weight them differently for diversity
-                    # Since we can't easily separate the gradients, we use the combined
-                    # gradient but could add noise based on the weight for diversity
-                    if w_refusal < 0.3:
-                        # Focus more on KL: add noise to push away from refusal optima
-                        grad = grad + 0.1 * torch.randn_like(grad)
-                    elif w_refusal > 0.7:
-                        # Focus more on refusal: slight noise
-                        grad = grad + 0.05 * torch.randn_like(grad)
+                            # Convert z to v for scoring
+                            v = self.smooth_param.z_to_v(z, normalize=True)
 
-                    # Riemannian gradient step
-                    v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+                            # Get gradient w.r.t. v
+                            scores, grad_v = self.scorer.score(v, return_grad=True)
 
-                candidates.append(v)
+                            # Convert gradient to z-space via chain rule
+                            # Includes normalization Jacobian: ∂L/∂z = basis.T @ (I - vv^T) @ ∂L/∂v / ||u||
+                            grad_z = self.smooth_param.gradient_z_to_v(grad_v, z=z, v=v)
+
+                            # Add noise for diversity based on weight
+                            if w_refusal < 0.3:
+                                grad_z = grad_z + 0.1 * torch.randn_like(grad_z)
+                            elif w_refusal > 0.7:
+                                grad_z = grad_z + 0.05 * torch.randn_like(grad_z)
+
+                            # Simple gradient descent in z-space (no Riemannian needed)
+                            # The smoothness constraint is built into the parameterization
+                            z = z - self.config.gradient_lr * grad_z
+
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                oom_occurred = True
+                                break
+                            raise
+
+                    # Convert final z back to v
+                    v_final = self.smooth_param.z_to_v(z, normalize=True)
+                    candidates.append(v_final.detach().cpu())
+                else:
+                    # === Original: optimize directly in v-space ===
+                    v = v_start.clone()
+
+                    # Run gradient descent
+                    for step in range(self.config.gradient_steps):
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                            # Get gradient of scalarized objective
+                            scores, grad = self.scorer.score(v, return_grad=True)
+
+                            # Add noise for diversity based on weight
+                            if w_refusal < 0.3:
+                                grad = grad + 0.1 * torch.randn_like(grad)
+                            elif w_refusal > 0.7:
+                                grad = grad + 0.05 * torch.randn_like(grad)
+
+                            # Riemannian gradient step
+                            v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                oom_occurred = True
+                                break
+                            raise
+
+                    candidates.append(v.detach().cpu())
 
                 # Early exit if we have enough candidates
                 if len(candidates) >= self.config.n_gradient_candidates:
@@ -1136,7 +1504,7 @@ class ParetoGeometryDiscovery:
 
             # First, score the initial point
             scores = self.scorer.score(v)
-            self.V_observed.append(v)
+            self.V_observed.append(v.detach().cpu())  # Store on CPU for consistency
             for obj, val in scores.items():
                 self.scores_observed[obj].append(val)
             samples_collected += 1
@@ -1144,27 +1512,91 @@ class ParetoGeometryDiscovery:
                   f"kl={scores['kl_score']:.4f}")
 
             # Now do gradient descent with varying weights to explore Pareto front
-            n_gradient_init = min(10, self.config.n_init_samples // 3)
+            # Use fewer trajectories (5) to reduce memory pressure
+            n_gradient_init = min(5, self.config.n_init_samples // 5)
             weights = [(i / (n_gradient_init - 1), 1 - i / (n_gradient_init - 1))
                        for i in range(n_gradient_init)] if n_gradient_init > 1 else [(0.5, 0.5)]
 
+            # Use smooth parameterization if enabled
+            use_smooth = self.config.use_smooth_parameterization and self.smooth_param is not None
+            if use_smooth:
+                print(f"  Using smooth parameterization ({self.config.n_basis} basis functions)")
+
+            oom_count = 0
             for w_idx, (w_r, w_k) in enumerate(weights):
-                v = self.v_init.clone()
-                v = self._normalize_vector(v)
+                if oom_count >= 2:
+                    # Too many OOM errors, skip remaining gradient trajectories
+                    print("  Skipping remaining gradient trajectories due to OOM...")
+                    break
 
-                # More gradient steps for initial exploration
-                for step in range(self.config.gradient_steps * 2):
-                    scores, grad = self.scorer.score(v, return_grad=True)
-                    v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+                if use_smooth:
+                    # === Smooth parameterization: optimize in z-space ===
+                    z = self.smooth_param.v_to_z(self.v_init)
 
-                # Store final point
-                scores = self.scorer.score(v)
-                self.V_observed.append(v)
+                    for step in range(self.config.gradient_steps):
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                            # Convert z to v for scoring
+                            v = self.smooth_param.z_to_v(z, normalize=True)
+
+                            # Get gradient w.r.t. v
+                            scores, grad_v = self.scorer.score(v, return_grad=True)
+
+                            # Convert gradient to z-space (includes normalization Jacobian)
+                            grad_z = self.smooth_param.gradient_z_to_v(grad_v, z=z, v=v)
+
+                            # Simple gradient descent in z-space
+                            z = z - self.config.gradient_lr * grad_z
+
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                print(f"  Warning: OOM during gradient step {step}, stopping trajectory...")
+                                oom_count += 1
+                                break
+                            raise
+
+                    # Convert final z to v
+                    v = self.smooth_param.z_to_v(z, normalize=True)
+                else:
+                    # === Original: optimize directly in v-space ===
+                    v = self.v_init.clone()
+                    v = self._normalize_vector(v)
+
+                    # Gradient steps for initial exploration
+                    for step in range(self.config.gradient_steps):
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                            scores, grad = self.scorer.score(v, return_grad=True)
+                            v = self._riemannian_gradient_step(v, grad, self.config.gradient_lr)
+
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                print(f"  Warning: OOM during gradient step {step}, stopping trajectory...")
+                                oom_count += 1
+                                break
+                            raise
+
+                # Store final point (without gradients)
+                with torch.no_grad():
+                    scores = self.scorer.score(v)
+                self.V_observed.append(v.detach().cpu())  # Store on CPU
                 for obj, val in scores.items():
                     self.scores_observed[obj].append(val)
                 samples_collected += 1
 
-                if w_idx % 3 == 0:
+                if w_idx % 2 == 0:
                     print(f"  Gradient init {w_idx+1}: refusal={scores['refusal_score']:.4f}, "
                           f"kl={scores['kl_score']:.4f}")
 
@@ -1182,8 +1614,8 @@ class ParetoGeometryDiscovery:
             # Score
             scores = self.scorer.score(v)
 
-            # Store
-            self.V_observed.append(v)
+            # Store on CPU for consistency
+            self.V_observed.append(v.detach().cpu())
             for obj, val in scores.items():
                 self.scores_observed[obj].append(val)
 
@@ -1215,8 +1647,8 @@ class ParetoGeometryDiscovery:
             # Score
             scores = self.scorer.score(v_next)
 
-            # Store
-            self.V_observed.append(v_next)
+            # Store on CPU for consistency
+            self.V_observed.append(v_next.detach().cpu())
             for obj, val in scores.items():
                 self.scores_observed[obj].append(val)
 
@@ -1400,25 +1832,31 @@ class ParetoGeometryDiscovery:
         V_tensor = torch.stack(self.V_observed)
         pareto_mask = self._get_pareto_mask()
         dominated_mask = ~pareto_mask
+        n_observed = len(self.V_observed)
+
+        def _aligned_scores(mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+            """Return scores for objectives aligned to V_observed length."""
+            aligned: Dict[str, torch.Tensor] = {}
+            for obj, vals in self.scores_observed.items():
+                if len(vals) != n_observed:
+                    # Skip objectives that were never recorded (e.g., no completions)
+                    continue
+                aligned[obj] = torch.tensor(vals)[mask]
+            return aligned
 
         # Pareto vectors and scores
         pareto_vectors = V_tensor[pareto_mask]
-        pareto_scores = {
-            obj: torch.tensor(self.scores_observed[obj])[pareto_mask]
-            for obj in self.scores_observed
-        }
+        pareto_scores = _aligned_scores(pareto_mask)
 
         # Dominated vectors and scores
         dominated_vectors = V_tensor[dominated_mask]
-        dominated_scores = {
-            obj: torch.tensor(self.scores_observed[obj])[dominated_mask]
-            for obj in self.scores_observed
-        }
+        dominated_scores = _aligned_scores(dominated_mask)
 
         # All scores
         all_scores = {
             obj: torch.tensor(vals)
             for obj, vals in self.scores_observed.items()
+            if len(vals) == n_observed
         }
 
         hv = self._compute_hypervolume()
@@ -1541,3 +1979,612 @@ def discover_pareto_boundary(
     )
 
     return discovery.discover()
+
+
+@dataclass
+class BoundaryThenParetoConfig:
+    """Configuration for two-phase boundary + Pareto discovery."""
+
+    # Phase 1: Boundary discovery
+    # Dynamic threshold: boundary = baseline_refusal - fraction * (baseline_refusal - baseline_harmless)
+    # This places the boundary at `fraction` of the way from refusal to non-refusal
+    use_dynamic_threshold: bool = True  # Compute threshold from baseline
+    boundary_fraction: float = 0.05  # Fraction of gap from refusal to non-refusal (5% = just starting to work)
+    boundary_threshold: float = 0.0  # Fixed threshold (used if use_dynamic_threshold=False)
+    n_boundary_init: int = 20  # Initial samples for boundary
+    n_boundary_iterations: int = 30  # Iterations to find boundary
+    boundary_beta: float = 1.96  # Exploration parameter for straddle
+
+    # Phase 2: Pareto search inside boundary
+    n_pareto_init: int = 10  # Initial samples inside boundary
+    n_pareto_iterations: int = 50  # Pareto iterations
+    pareto_beta: float = 0.5  # UCB exploration for Pareto
+
+    # Shared settings
+    max_measurements: int = 150
+    gp_type: str = 'structured'
+    layer_lengthscale: float = 3.0
+    kernel_lengthscale: float = 0.3
+
+    # Gradient settings
+    use_gradient_candidates: bool = True
+    gradient_steps: int = 5
+    gradient_lr: float = 0.1
+
+    # Smooth parameterization
+    use_smooth_parameterization: bool = True
+    n_basis: int = 8
+
+    # Multi-fidelity optimization
+    # Screen many candidates cheaply (few prompts), then evaluate best with full prompts
+    # Cost comparison (8 harmful + 8 harmless prompts):
+    #   Single fidelity: 1 candidate × 16 prompts = 16 prompt-passes
+    #   Multi-fidelity:  8 screen × 4 prompts + 1 promote × 16 = 48 prompt-passes
+    # BUT multi-fidelity evaluates 8× more candidates, so better exploration per iteration
+    use_multi_fidelity: bool = False  # Disabled by default (enable for better exploration at ~3× cost)
+    low_fidelity_fraction: float = 0.25  # Use 25% of prompts for screening (e.g., 2 of 8)
+    n_screen_candidates: int = 8  # Number of candidates to screen with low fidelity
+    n_promote: int = 1  # Number of candidates to promote to high-fidelity evaluation
+
+
+@dataclass
+class BoundaryThenParetoResults:
+    """Results from two-phase discovery."""
+
+    # Phase 1 results
+    boundary_points: torch.Tensor  # Points near threshold
+    inside_points: torch.Tensor  # Points where ablation works (refusal < threshold)
+    outside_points: torch.Tensor  # Points where ablation fails
+
+    # Phase 2 results (Pareto frontier INSIDE boundary)
+    pareto_vectors: torch.Tensor
+    pareto_scores: Dict[str, torch.Tensor]
+
+    # All observations
+    V_observed: torch.Tensor
+    scores_observed: Dict[str, torch.Tensor]
+
+    # Metadata
+    boundary_threshold: float
+    n_boundary_measurements: int
+    n_pareto_measurements: int
+    hypervolume: float
+
+
+class BoundaryThenParetoDiscovery:
+    """
+    Two-phase discovery: first find boundary, then Pareto search inside.
+
+    Phase 1 (Boundary): Uses straddle acquisition to find where refusal_score
+    crosses the threshold. This identifies the "working region" where ablation
+    succeeds.
+
+    Phase 2 (Pareto): Searches for optimal trade-offs between refusal and KL
+    ONLY inside the boundary. Candidates outside are rejected.
+
+    This is more efficient than unconstrained Pareto search because:
+    - Boundary discovery focuses measurements on the important transition
+    - Pareto search doesn't waste measurements on non-working vectors
+    """
+
+    def __init__(
+        self,
+        scorer: MultiObjectiveScorer,
+        n_layers: int,
+        hidden_dim: int,
+        config: Optional[BoundaryThenParetoConfig] = None,
+        v_init: Optional[torch.Tensor] = None
+    ):
+        self.scorer = scorer
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
+        self.config = config or BoundaryThenParetoConfig()
+        self.v_init = v_init
+
+        # Observations (shared across phases)
+        self.V_observed: List[torch.Tensor] = []
+        self.scores_observed: Dict[str, List[float]] = {
+            'refusal_score': [],
+            'kl_score': [],
+            'induce_score': [],
+            'ablation_loss': [],
+            'retain_loss': [],
+        }
+
+        # GP for refusal score (used in boundary phase)
+        from .adaptive_geometry_discovery import SimpleGP, StructuredLayerGP
+        if self.config.gp_type == 'structured':
+            self.refusal_gp = StructuredLayerGP(
+                n_layers=n_layers,
+                hidden_dim=hidden_dim,
+                feature_lengthscale=self.config.kernel_lengthscale,
+                layer_lengthscale=self.config.layer_lengthscale
+            )
+        else:
+            self.refusal_gp = SimpleGP(lengthscale=self.config.kernel_lengthscale)
+
+    def discover(self) -> BoundaryThenParetoResults:
+        """Run two-phase discovery."""
+
+        print("=" * 70)
+        print("Two-Phase Discovery: Boundary → Pareto")
+        print("=" * 70)
+
+        # Compute dynamic threshold from baseline if enabled
+        if self.config.use_dynamic_threshold:
+            baseline_refusal, baseline_harmless = self.scorer.compute_baseline_refusal_scores()
+            gap = baseline_refusal - baseline_harmless
+            self.config.boundary_threshold = baseline_refusal - self.config.boundary_fraction * gap
+            print(f"Dynamic threshold: refusal={baseline_refusal:.3f}, harmless={baseline_harmless:.3f}")
+            print(f"  Gap={gap:.3f}, fraction={self.config.boundary_fraction:.0%}")
+            print(f"  Boundary = {baseline_refusal:.3f} - {self.config.boundary_fraction:.0%}*{gap:.3f} = {self.config.boundary_threshold:.3f}")
+        else:
+            print(f"Fixed boundary threshold: {self.config.boundary_threshold}")
+
+        # Evaluate v_init first (if provided) to include in observations
+        if self.v_init is not None:
+            print("Evaluating initial vector (difference-in-means)...")
+            v_init_normed = self.v_init / (self.v_init.norm() + 1e-8)
+            scores = self.scorer.score(v_init_normed)
+            self.V_observed.append(v_init_normed.detach().cpu())
+            for obj, val in scores.items():
+                self.scores_observed[obj].append(val)
+            print(f"  v_init refusal={scores['refusal_score']:.4f}, kl={scores.get('kl_score', 0):.4f}")
+
+        # Phase 1: Find boundary
+        print("\n" + "=" * 70)
+        print("Phase 1: Boundary Discovery")
+        print("=" * 70)
+        boundary_points, inside_points, outside_points = self._boundary_phase()
+        n_boundary = len(self.V_observed)
+
+        print(f"\n  Boundary points: {len(boundary_points)}")
+        print(f"  Inside (ablation works): {len(inside_points)}")
+        print(f"  Outside (ablation fails): {len(outside_points)}")
+
+        if len(inside_points) == 0:
+            print("  WARNING: No points inside boundary! Adjusting threshold...")
+            # Use the best refusal score as new threshold
+            best_refusal = min(self.scores_observed['refusal_score'])
+            self.config.boundary_threshold = best_refusal + 1.0
+            # Re-classify
+            boundary_points, inside_points, outside_points = self._classify_points()
+
+        # Phase 2: Pareto search inside boundary
+        print("\n" + "=" * 70)
+        print("Phase 2: Constrained Pareto Search (inside boundary)")
+        print("=" * 70)
+        pareto_vectors, pareto_scores, hypervolume = self._pareto_phase(inside_points)
+        n_pareto = len(self.V_observed) - n_boundary
+
+        print(f"\n  Pareto vectors found: {len(pareto_vectors)}")
+        print(f"  Hypervolume: {hypervolume:.4f}")
+
+        return BoundaryThenParetoResults(
+            boundary_points=torch.stack(boundary_points) if boundary_points else torch.empty(0),
+            inside_points=torch.stack(inside_points) if inside_points else torch.empty(0),
+            outside_points=torch.stack(outside_points) if outside_points else torch.empty(0),
+            pareto_vectors=pareto_vectors,
+            pareto_scores=pareto_scores,
+            V_observed=torch.stack(self.V_observed),
+            scores_observed={k: torch.tensor(v) for k, v in self.scores_observed.items()},
+            boundary_threshold=self.config.boundary_threshold,
+            n_boundary_measurements=n_boundary,
+            n_pareto_measurements=n_pareto,
+            hypervolume=hypervolume
+        )
+
+    def _boundary_phase(self) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """Phase 1: Find the boundary using straddle acquisition."""
+
+        threshold = self.config.boundary_threshold
+
+        # Initial exploration
+        print(f"  Initial exploration ({self.config.n_boundary_init} samples)...")
+        for i in range(self.config.n_boundary_init):
+            if self.v_init is not None and i < self.config.n_boundary_init // 3:
+                # Near v_init: small perturbation
+                v = self.v_init + 0.3 * torch.randn_like(self.v_init)
+            else:
+                # Random direction: match v_init's per-layer norm structure
+                device = self.v_init.device if self.v_init is not None else 'cpu'
+                v = torch.randn(self.n_layers, self.hidden_dim, device=device)
+                if self.v_init is not None:
+                    # Scale each layer to match v_init's per-layer norms
+                    v_init_norms = self.v_init.norm(dim=-1, keepdim=True)
+                    v = v / (v.norm(dim=-1, keepdim=True) + 1e-8) * v_init_norms
+            # Normalize globally (for GP, which expects unit vectors)
+            v = v / (v.norm() + 1e-8)
+
+            scores = self.scorer.score(v)
+            self.V_observed.append(v.detach().cpu())
+            for obj, val in scores.items():
+                self.scores_observed[obj].append(val)
+
+            if i % 10 == 0:
+                print(f"    Sample {i+1}: refusal={scores['refusal_score']:.4f}")
+
+        # Fit GP
+        self._update_refusal_gp()
+
+        # Boundary iterations using straddle acquisition
+        if self.config.use_multi_fidelity:
+            print(f"  Multi-fidelity straddle search ({self.config.n_boundary_iterations} iterations)...")
+            print(f"    Low-fidelity: {self.config.low_fidelity_fraction:.0%} of prompts, "
+                  f"screen {self.config.n_screen_candidates} → promote {self.config.n_promote}")
+        else:
+            print(f"  Straddle search ({self.config.n_boundary_iterations} iterations)...")
+
+        for iteration in range(self.config.n_boundary_iterations):
+            if len(self.V_observed) >= self.config.max_measurements // 2:
+                break
+
+            # Generate candidates
+            n_candidates = self.config.n_screen_candidates if self.config.use_multi_fidelity else 50
+            candidates = self._generate_candidates(near_boundary=True, n_candidates=n_candidates)
+
+            # Straddle acquisition: β*σ - |μ - threshold|
+            V_flat = candidates.reshape(len(candidates), -1)
+            mu, sigma = self.refusal_gp.predict(V_flat)
+            straddle = self.config.boundary_beta * sigma - torch.abs(mu - threshold)
+
+            if self.config.use_multi_fidelity:
+                # Multi-fidelity: screen with low fidelity, promote best to high fidelity
+                # Step 1: Get top candidates by GP acquisition
+                top_k = min(self.config.n_promote * 3, len(candidates))
+                top_indices = straddle.argsort(descending=True)[:top_k]
+
+                # Step 2: Score top candidates with low fidelity
+                low_fi_scores = []
+                for idx in top_indices:
+                    v = candidates[idx]
+                    s = self.scorer.score(v, fidelity=self.config.low_fidelity_fraction)
+                    low_fi_scores.append(s['refusal_score'])
+
+                # Step 3: Select best by low-fidelity straddle
+                low_fi_scores = torch.tensor(low_fi_scores)
+                low_fi_straddle = -torch.abs(low_fi_scores - threshold)  # Closer to threshold = better
+                promote_indices = low_fi_straddle.argsort(descending=True)[:self.config.n_promote]
+
+                # Step 4: Evaluate promoted candidates with high fidelity
+                best_score = None
+                best_v = None
+                for pi in promote_indices:
+                    orig_idx = top_indices[pi]
+                    v = candidates[orig_idx]
+                    scores = self.scorer.score(v, fidelity=1.0)
+
+                    if best_score is None or abs(scores['refusal_score'] - threshold) < abs(best_score['refusal_score'] - threshold):
+                        best_score = scores
+                        best_v = v
+
+                # Add best to observations
+                self.V_observed.append(best_v.detach().cpu())
+                for obj, val in best_score.items():
+                    self.scores_observed[obj].append(val)
+                scores = best_score
+            else:
+                # Single fidelity: just pick best by GP acquisition
+                best_idx = straddle.argmax()
+                v_next = candidates[best_idx]
+
+                # Score with full fidelity
+                scores = self.scorer.score(v_next)
+                self.V_observed.append(v_next.detach().cpu())
+                for obj, val in scores.items():
+                    self.scores_observed[obj].append(val)
+
+            # Update GP
+            self._update_refusal_gp()
+
+            if iteration % 10 == 0:
+                print(f"    Iter {iteration}: refusal={scores['refusal_score']:.4f}")
+
+        # Classify points
+        return self._classify_points()
+
+    def _classify_points(self) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """Classify observed points as inside/outside/boundary."""
+        threshold = self.config.boundary_threshold
+        boundary_margin = 1.0  # Points within this margin of threshold are "boundary"
+
+        inside = []
+        outside = []
+        boundary = []
+
+        for v, r in zip(self.V_observed, self.scores_observed['refusal_score']):
+            if r < threshold - boundary_margin:
+                inside.append(v)
+            elif r > threshold + boundary_margin:
+                outside.append(v)
+            else:
+                boundary.append(v)
+
+        return boundary, inside, outside
+
+    def _pareto_phase(
+        self,
+        inside_points: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], float]:
+        """Phase 2: Pareto search constrained to inside boundary."""
+
+        # Use inside points as starting points
+        starting_points = inside_points if inside_points else self.V_observed[-10:]
+
+        # Create a constrained Pareto discovery
+        pareto_config = ParetoDiscoveryConfig(
+            n_init_samples=min(self.config.n_pareto_init, len(starting_points)),
+            n_pareto_iterations=self.config.n_pareto_iterations,
+            max_measurements=self.config.max_measurements - len(self.V_observed),
+            beta=self.config.pareto_beta,
+            gp_type=self.config.gp_type,
+            layer_lengthscale=self.config.layer_lengthscale,
+            kernel_lengthscale=self.config.kernel_lengthscale,
+            use_gradient_candidates=self.config.use_gradient_candidates,
+            gradient_steps=self.config.gradient_steps,
+            gradient_lr=self.config.gradient_lr,
+            use_smooth_parameterization=self.config.use_smooth_parameterization,
+            n_basis=self.config.n_basis
+        )
+
+        # Initialize Pareto discovery with inside points
+        pareto_discovery = ParetoGeometryDiscovery(
+            scorer=self.scorer,
+            n_layers=self.n_layers,
+            hidden_dim=self.hidden_dim,
+            config=pareto_config,
+            v_init=starting_points[0] if starting_points else None,
+            use_mean_diff_init=False
+        )
+
+        # Seed with existing inside points (skip re-scoring)
+        index_by_id = {id(v): i for i, v in enumerate(self.V_observed)}
+        for v in starting_points[:pareto_config.n_init_samples]:
+            idx = index_by_id.get(id(v))
+            if idx is None:
+                # Fallback: try to find by value (should be rare)
+                for i, v_obs in enumerate(self.V_observed):
+                    if torch.allclose(v_obs, v):
+                        idx = i
+                        break
+
+            if idx is None:
+                # Not previously observed; score once and add to Pareto only
+                scores = self.scorer.score(v)
+                pareto_discovery.V_observed.append(v.detach().cpu())
+                for obj, val in scores.items():
+                    pareto_discovery.scores_observed[obj].append(val)
+                continue
+
+            # Reuse cached scores from boundary phase
+            pareto_discovery.V_observed.append(v.detach().cpu())
+            for obj, vals in self.scores_observed.items():
+                if idx < len(vals):
+                    pareto_discovery.scores_observed[obj].append(vals[idx])
+
+        pareto_discovery._update_gps()
+
+        # Run Pareto iterations with boundary constraint
+        print(f"  Pareto search ({pareto_config.n_pareto_iterations} iterations)...")
+        for iteration in range(pareto_config.n_pareto_iterations):
+            if len(self.V_observed) >= self.config.max_measurements:
+                break
+
+            # Generate candidates
+            candidates = pareto_discovery._generate_candidates()
+
+            # Filter to inside boundary (predict with refusal GP)
+            V_flat = candidates.reshape(len(candidates), -1)
+            mu_refusal, _ = self.refusal_gp.predict(V_flat)
+            inside_mask = mu_refusal < self.config.boundary_threshold
+            valid_candidates = candidates[inside_mask]
+
+            if len(valid_candidates) == 0:
+                # All candidates outside - sample near inside points
+                idx = torch.randint(len(starting_points), (1,)).item()
+                v_next = starting_points[idx] + 0.1 * torch.randn_like(starting_points[idx])
+                v_next = v_next / (v_next.norm() + 1e-8)
+            else:
+                # Compute acquisition on valid candidates
+                acquisition = pareto_discovery._compute_ehvi_acquisition(valid_candidates)
+                best_idx = acquisition.argmax()
+                v_next = valid_candidates[best_idx]
+
+            # Score
+            scores = self.scorer.score(v_next)
+
+            # Store in both
+            pareto_discovery.V_observed.append(v_next.detach().cpu())
+            self.V_observed.append(v_next.detach().cpu())
+            for obj, val in scores.items():
+                pareto_discovery.scores_observed[obj].append(val)
+                self.scores_observed[obj].append(val)
+
+            pareto_discovery._update_gps()
+
+            if iteration % 10 == 0:
+                hv = pareto_discovery._compute_hypervolume()
+                print(f"    Iter {iteration}: refusal={scores['refusal_score']:.4f}, "
+                      f"kl={scores['kl_score']:.4f}, HV={hv:.4f}")
+
+        # Extract Pareto frontier
+        results = pareto_discovery._extract_pareto()
+        return results.pareto_vectors, results.pareto_scores, results.hypervolume
+
+    def _compute_refusal_gradient(self, v: torch.Tensor) -> torch.Tensor:
+        """
+        Compute gradient of refusal_score with respect to v.
+
+        Uses the scorer's gradient computation (actual loss gradient through model).
+        Falls back to GP gradient if scorer doesn't support gradients.
+        """
+        v = v.clone().detach().requires_grad_(True)
+
+        # Try to get gradient from scorer (actual loss gradient)
+        if hasattr(self.scorer, 'score_with_grad'):
+            try:
+                scores, grad = self.scorer.score_with_grad(v)
+                return grad['refusal_score'].detach()
+            except Exception:
+                pass
+
+        # Fallback: use GP gradient (less accurate but always available)
+        v_flat = v.reshape(1, -1)
+        mu, _ = self.refusal_gp.predict(v_flat)
+
+        # Compute gradient of GP mean
+        mu.sum().backward()
+        grad = v.grad.clone()
+
+        return grad.detach()
+
+    def _project_orthogonal_to_gradient(
+        self,
+        directions: torch.Tensor,
+        gradient: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Project directions to be orthogonal to the gradient.
+
+        This keeps movement along the boundary (level set) rather than across it.
+
+        Args:
+            directions: [N, n_layers, hidden_dim] candidate directions
+            gradient: [n_layers, hidden_dim] gradient to project out
+
+        Returns:
+            Orthogonalized directions (still on unit sphere)
+        """
+        g_flat = gradient.reshape(-1)
+        g_norm_sq = (g_flat @ g_flat) + 1e-8
+
+        result = []
+        for d in directions:
+            d_flat = d.reshape(-1)
+            # Project out gradient component: d' = d - (d·g / ||g||²) * g
+            proj = (d_flat @ g_flat) / g_norm_sq
+            d_orthogonal = d_flat - proj * g_flat
+
+            # Reshape and normalize back to sphere
+            d_orthogonal = d_orthogonal.reshape(self.n_layers, self.hidden_dim)
+            d_orthogonal = d_orthogonal / (d_orthogonal.norm() + 1e-8)
+            result.append(d_orthogonal)
+
+        return torch.stack(result)
+
+    def _generate_candidates(self, near_boundary: bool = False, n_candidates: int = 200) -> torch.Tensor:
+        """
+        Generate candidate vectors.
+
+        Args:
+            near_boundary: If True and we have boundary points, use smarter exploration
+            n_candidates: Number of candidates to generate
+
+        When near_boundary=True and we have points on the boundary:
+        - If use_gradient_candidates=True: uses gradient-orthogonal exploration
+        - If use_gradient_candidates=False: uses simple random perturbation (faster)
+        """
+        candidates = []
+        n_total = n_candidates
+
+        if near_boundary and len(self.V_observed) > 5:
+            threshold = self.config.boundary_threshold
+            scores = torch.tensor(self.scores_observed['refusal_score'])
+            distances = torch.abs(scores - threshold)
+            near_indices = distances.argsort()[:10]
+
+            # Find points that are actually ON the boundary (within margin)
+            boundary_margin = 1.0
+            on_boundary_mask = distances < boundary_margin
+            boundary_indices = torch.where(on_boundary_mask)[0]
+
+            if len(boundary_indices) > 0 and self.config.use_gradient_candidates:
+                # === Gradient-orthogonal exploration for boundary points ===
+                n_orthogonal = n_total // 3
+
+                for _ in range(n_orthogonal):
+                    # Pick a boundary point
+                    idx = boundary_indices[torch.randint(len(boundary_indices), (1,))].item()
+                    v_boundary = self.V_observed[idx]
+
+                    # Compute gradient at this point
+                    try:
+                        grad = self._compute_refusal_gradient(v_boundary)
+
+                        # Generate random direction and project orthogonal to gradient
+                        d_random = torch.randn(self.n_layers, self.hidden_dim)
+                        d_orthogonal = self._project_orthogonal_to_gradient(
+                            d_random.unsqueeze(0), grad
+                        )[0]
+
+                        # Move along orthogonal direction (stay on boundary)
+                        step_size = 0.2
+                        v_new = v_boundary + step_size * d_orthogonal
+                        v_new = v_new / (v_new.norm() + 1e-8)
+                        candidates.append(v_new)
+                    except Exception:
+                        # Fallback to random perturbation
+                        v = v_boundary + 0.2 * torch.randn_like(v_boundary)
+                        v = v / (v.norm() + 1e-8)
+                        candidates.append(v)
+
+                # === Gradient descent toward boundary for off-boundary points ===
+                n_toward_boundary = n_total // 3
+
+                for _ in range(n_toward_boundary):
+                    # Pick a point not on boundary
+                    off_boundary = torch.where(~on_boundary_mask)[0]
+                    if len(off_boundary) == 0:
+                        off_boundary = near_indices
+                    idx = off_boundary[torch.randint(len(off_boundary), (1,))].item()
+                    v_start = self.V_observed[idx]
+                    score = scores[idx].item()
+
+                    try:
+                        grad = self._compute_refusal_gradient(v_start)
+
+                        # Move toward threshold:
+                        # if score > threshold (outside), move in -grad direction
+                        # if score < threshold (inside), move in +grad direction
+                        if score > threshold:
+                            direction = -grad  # Decrease refusal
+                        else:
+                            direction = grad   # Increase refusal
+
+                        direction = direction / (direction.norm() + 1e-8)
+                        step_size = 0.1
+                        v_new = v_start + step_size * direction
+                        v_new = v_new / (v_new.norm() + 1e-8)
+                        candidates.append(v_new)
+                    except Exception:
+                        v = v_start + 0.2 * torch.randn_like(v_start)
+                        v = v / (v.norm() + 1e-8)
+                        candidates.append(v)
+            elif len(boundary_indices) > 0:
+                # Boundary points exist but no gradients - simple perturbation
+                for _ in range(n_total // 2):
+                    idx = boundary_indices[torch.randint(len(boundary_indices), (1,))].item()
+                    v = self.V_observed[idx] + 0.2 * torch.randn(self.n_layers, self.hidden_dim)
+                    v = v / (v.norm() + 1e-8)
+                    candidates.append(v)
+            else:
+                # No boundary points yet - sample near points closest to threshold
+                for _ in range(n_total // 2):
+                    idx = near_indices[torch.randint(len(near_indices), (1,))].item()
+                    v = self.V_observed[idx] + 0.2 * torch.randn(self.n_layers, self.hidden_dim)
+                    v = v / (v.norm() + 1e-8)
+                    candidates.append(v)
+
+        # Random samples for exploration
+        while len(candidates) < n_total:
+            v = torch.randn(self.n_layers, self.hidden_dim)
+            v = v / (v.norm() + 1e-8)
+            candidates.append(v)
+
+        return torch.stack(candidates)
+
+    def _update_refusal_gp(self):
+        """Update the refusal GP with current observations."""
+        V_flat = torch.stack(self.V_observed).reshape(len(self.V_observed), -1)
+        R = torch.tensor(self.scores_observed['refusal_score'])
+        self.refusal_gp.fit(V_flat, R)

@@ -526,8 +526,20 @@ class StructuredLayerGP:
         if V.dim() == 2:
             V = V.reshape(-1, self.n_layers, self.hidden_dim)
 
-        self.V_train = V
-        self.R_train = R
+        # Ensure tensors are float and on correct device (don't need grad for data)
+        device = V.device
+        self.V_train = V.float().detach().cpu()  # Keep on CPU for GP
+        self.R_train = R.float().detach().cpu()
+
+        # Move learnable parameters to CPU (where computation happens)
+        if self.log_layer_weights.device != torch.device('cpu'):
+            self.log_layer_weights = self.log_layer_weights.cpu()
+            self.log_feature_lengthscale = self.log_feature_lengthscale.cpu()
+            self.log_layer_lengthscale = self.log_layer_lengthscale.cpu()
+            if self.learn_layer_weights:
+                self.log_layer_weights.requires_grad_(True)
+                self.log_feature_lengthscale.requires_grad_(True)
+                self.log_layer_lengthscale.requires_grad_(True)
 
         if self.learn_layer_weights and len(V) > 5:
             self._optimize_hyperparameters()
@@ -536,6 +548,12 @@ class StructuredLayerGP:
 
     def _optimize_hyperparameters(self):
         """Optimize kernel hyperparameters via marginal likelihood."""
+        # Ensure params have grad enabled
+        if not self.log_layer_weights.requires_grad:
+            self.log_layer_weights.requires_grad_(True)
+            self.log_feature_lengthscale.requires_grad_(True)
+            self.log_layer_lengthscale.requires_grad_(True)
+
         params = [self.log_layer_weights, self.log_feature_lengthscale, self.log_layer_lengthscale]
         optimizer = torch.optim.Adam(params, lr=self.lr)
 
@@ -557,8 +575,14 @@ class StructuredLayerGP:
             complexity = -torch.diag(L).log().sum()
             lml = data_fit + complexity
 
-            (-lml).backward()  # Maximize LML
-            optimizer.step()
+            try:
+                (-lml).backward()  # Maximize LML
+                optimizer.step()
+            except RuntimeError as e:
+                # Gradient computation failed - skip optimization
+                if "does not require grad" in str(e):
+                    return
+                raise
 
     def _update_cache(self):
         """Update cached Cholesky and alpha for prediction."""

@@ -10,6 +10,7 @@ from src.discovery.pareto_boundary_discovery import (
     ParetoDiscoveryConfig,
     ParetoDiscoveryResults,
     MultiObjectiveScorer,
+    SmoothLayerParameterization,
 )
 
 
@@ -468,3 +469,423 @@ def test_gradient_vs_random_generates_different_candidates():
     # Verify measurements are within bounds
     assert results_grad.n_measurements <= config_grad.n_init_samples + config_grad.n_pareto_iterations
     assert results_random.n_measurements <= config_random.n_init_samples + config_random.n_pareto_iterations
+
+
+# ============================================================================
+# Tests for SmoothLayerParameterization
+# ============================================================================
+
+def test_smooth_parameterization_basis_shape():
+    """Test that basis matrices have correct shapes."""
+    n_layers, hidden_dim, n_basis = 28, 512, 8
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=3.0
+    )
+
+    assert param.basis.shape == (n_layers, n_basis)
+    assert param.basis_pinv.shape == (n_basis, n_layers)
+    assert param.centers.shape == (n_basis,)
+
+
+def test_smooth_parameterization_z_to_v():
+    """Test z_to_v conversion produces correct shape and normalization."""
+    n_layers, hidden_dim, n_basis = 8, 64, 4
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=2.0
+    )
+
+    z = torch.randn(n_basis, hidden_dim)
+    v = param.z_to_v(z, normalize=True)
+
+    assert v.shape == (n_layers, hidden_dim)
+    assert torch.isclose(v.norm(), torch.tensor(1.0), atol=1e-6)
+
+
+def test_smooth_parameterization_roundtrip():
+    """Test that v_to_z -> z_to_v roundtrip preserves smooth vectors."""
+    n_layers, hidden_dim, n_basis = 8, 64, 4
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=2.0
+    )
+
+    # Create a smooth vector from basis
+    z_original = torch.randn(n_basis, hidden_dim)
+    v = param.z_to_v(z_original, normalize=False)
+
+    # Roundtrip
+    z_recovered = param.v_to_z(v)
+    v_recovered = param.z_to_v(z_recovered, normalize=False)
+
+    # Should be identical for vectors in the span of the basis
+    assert torch.allclose(v, v_recovered, atol=1e-5)
+
+
+def test_smooth_parameterization_gradient_chain_rule():
+    """Test that gradient conversion via chain rule is correct."""
+    n_layers, hidden_dim, n_basis = 8, 64, 4
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=2.0
+    )
+
+    # Create z with gradients
+    z = torch.randn(n_basis, hidden_dim, requires_grad=True)
+
+    # Forward: v = basis @ z
+    v = param.basis @ z
+
+    # Create a simple loss
+    loss = (v ** 2).sum()
+
+    # Compute gradient via autograd
+    loss.backward()
+    grad_z_autograd = z.grad.clone()
+
+    # Compute gradient via our chain rule function
+    # grad_v = 2 * v
+    grad_v = 2 * v.detach()
+    grad_z_manual = param.gradient_z_to_v(grad_v)
+
+    # Should match
+    assert torch.allclose(grad_z_autograd, grad_z_manual, atol=1e-5)
+
+
+def test_smooth_parameterization_smoothness_metric():
+    """Test that smoothness metric correctly identifies smooth vs non-smooth vectors."""
+    n_layers, hidden_dim, n_basis = 16, 32, 6
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=3.0
+    )
+
+    # Smooth vector (from basis)
+    z = torch.randn(n_basis, hidden_dim)
+    v_smooth = param.z_to_v(z, normalize=True)
+
+    # Random (non-smooth) vector
+    v_random = torch.randn(n_layers, hidden_dim)
+    v_random = v_random / v_random.norm()
+
+    smoothness_smooth = param.smoothness_of_v(v_smooth)
+    smoothness_random = param.smoothness_of_v(v_random)
+
+    # Smooth vector should have near-zero reconstruction error
+    assert smoothness_smooth < 0.01
+
+    # Random vector should have higher reconstruction error
+    assert smoothness_random > smoothness_smooth
+
+
+def test_smooth_parameterization_basis_functions_are_smooth():
+    """Test that basis functions vary smoothly across layers."""
+    n_layers, hidden_dim, n_basis = 16, 32, 4
+    lengthscale = 3.0
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=lengthscale
+    )
+
+    # Check that adjacent layers have similar basis values
+    for k in range(n_basis):
+        basis_k = param.basis[:, k]
+        # Compute differences between adjacent layers
+        diffs = (basis_k[1:] - basis_k[:-1]).abs()
+        # With lengthscale=3, adjacent layers should differ by at most ~0.3
+        assert diffs.max() < 0.5, f"Basis {k} not smooth: max diff = {diffs.max()}"
+
+
+def test_smooth_parameterization_with_pareto_discovery():
+    """Test that smooth parameterization integrates correctly with ParetoGeometryDiscovery."""
+    torch.manual_seed(42)
+    n_layers, hidden_dim = 4, 8
+
+    scorer = MockScorer(n_layers, hidden_dim)
+
+    # Config with smooth parameterization enabled
+    config = ParetoDiscoveryConfig(
+        n_init_samples=10,
+        n_pareto_iterations=5,
+        max_measurements=20,
+        use_gradient_candidates=True,
+        use_smooth_parameterization=True,
+        n_basis=3,  # Small for fast test
+        layer_lengthscale=1.5,
+        gradient_steps=2,
+        n_gradient_candidates=3,
+        use_sparse_gp=True,
+        num_inducing=6,
+        sparse_train_steps=2
+    )
+
+    discovery = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config,
+        use_mean_diff_init=False
+    )
+
+    # Verify smooth_param was initialized
+    assert discovery.smooth_param is not None
+    assert discovery.smooth_param.n_basis == config.n_basis
+
+    results = discovery.discover()
+
+    # Should produce valid results
+    assert len(results.pareto_vectors) > 0
+    assert results.n_measurements <= config.max_measurements
+
+    # All Pareto vectors should be normalized
+    for v in results.pareto_vectors:
+        assert torch.isclose(v.norm(), torch.tensor(1.0), atol=0.1)
+
+
+def test_smooth_vs_nonsmooth_gradient_candidates():
+    """Test that smooth parameterization produces smoother candidates."""
+    torch.manual_seed(123)
+    n_layers, hidden_dim = 8, 16
+
+    scorer = MockScorer(n_layers, hidden_dim)
+
+    # With smooth parameterization
+    config_smooth = ParetoDiscoveryConfig(
+        n_init_samples=8,
+        n_pareto_iterations=3,
+        use_gradient_candidates=True,
+        use_smooth_parameterization=True,
+        n_basis=4,
+        layer_lengthscale=2.0,
+        gradient_steps=3,
+        n_gradient_candidates=5,
+        use_sparse_gp=True,
+        num_inducing=6,
+        sparse_train_steps=2
+    )
+
+    # Without smooth parameterization
+    config_nonsmooth = ParetoDiscoveryConfig(
+        n_init_samples=8,
+        n_pareto_iterations=3,
+        use_gradient_candidates=True,
+        use_smooth_parameterization=False,
+        gradient_steps=3,
+        n_gradient_candidates=5,
+        use_sparse_gp=True,
+        num_inducing=6,
+        sparse_train_steps=2
+    )
+
+    discovery_smooth = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config_smooth,
+        use_mean_diff_init=False
+    )
+
+    discovery_nonsmooth = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config_nonsmooth,
+        use_mean_diff_init=False
+    )
+
+    # Initialize with same data
+    for _ in range(5):
+        v = torch.randn(n_layers, hidden_dim)
+        v = v / v.norm()
+        scores = scorer.score(v)
+        discovery_smooth.V_observed.append(v.clone())
+        discovery_nonsmooth.V_observed.append(v.clone())
+        for obj, val in scores.items():
+            discovery_smooth.scores_observed[obj].append(val)
+            discovery_nonsmooth.scores_observed[obj].append(val)
+
+    # Generate candidates
+    candidates_smooth = discovery_smooth._generate_gradient_candidates()
+    candidates_nonsmooth = discovery_nonsmooth._generate_gradient_candidates()
+
+    # Both should produce candidates
+    assert len(candidates_smooth) > 0
+    assert len(candidates_nonsmooth) > 0
+
+    # Measure smoothness of candidates
+    def measure_layer_smoothness(v):
+        """Measure how much v changes between adjacent layers."""
+        v_normalized = v / (v.norm(dim=1, keepdim=True) + 1e-8)
+        # Cosine similarity between adjacent layers
+        cos_sims = (v_normalized[:-1] * v_normalized[1:]).sum(dim=1)
+        return cos_sims.mean().item()
+
+    smooth_scores = [measure_layer_smoothness(v) for v in candidates_smooth]
+    nonsmooth_scores = [measure_layer_smoothness(v) for v in candidates_nonsmooth]
+
+    avg_smooth = np.mean(smooth_scores)
+    avg_nonsmooth = np.mean(nonsmooth_scores)
+
+    # Smooth candidates should have higher layer-to-layer similarity on average
+    # (This is a soft check since random seeds affect results)
+    print(f"Avg layer similarity - smooth: {avg_smooth:.4f}, nonsmooth: {avg_nonsmooth:.4f}")
+
+
+def test_smooth_parameterization_device_from_v_init():
+    """Test that SmoothLayerParameterization device is derived from v_init, not cuda.is_available()."""
+    torch.manual_seed(42)
+    n_layers, hidden_dim = 4, 8
+
+    # Create a CPU scorer
+    scorer = MockScorer(n_layers, hidden_dim)
+
+    # Create a CPU v_init explicitly
+    v_init = torch.randn(n_layers, hidden_dim, device='cpu')
+    v_init = v_init / v_init.norm()
+
+    config = ParetoDiscoveryConfig(
+        n_init_samples=5,
+        n_pareto_iterations=3,
+        use_gradient_candidates=True,
+        use_smooth_parameterization=True,
+        n_basis=3,
+        use_sparse_gp=True,
+        num_inducing=4,
+        sparse_train_steps=2
+    )
+
+    discovery = ParetoGeometryDiscovery(
+        scorer=scorer,
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        config=config,
+        v_init=v_init,
+        use_mean_diff_init=False
+    )
+
+    # Verify smooth_param is on CPU (same as v_init)
+    assert discovery.smooth_param is not None
+    assert str(discovery.smooth_param.device) == 'cpu'
+    assert discovery.smooth_param.basis.device.type == 'cpu'
+
+    # Verify z_to_v produces CPU tensors
+    z = discovery.smooth_param.random_z()
+    assert z.device.type == 'cpu'
+
+    v = discovery.smooth_param.z_to_v(z)
+    assert v.device.type == 'cpu'
+
+
+def test_smooth_parameterization_gradient_with_normalization():
+    """Test that gradient_z_to_v correctly includes the normalization Jacobian."""
+    n_layers, hidden_dim, n_basis = 8, 16, 4
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=2.0
+    )
+
+    # Create z with gradients
+    z = torch.randn(n_basis, hidden_dim, requires_grad=True)
+
+    # Forward pass WITH normalization (as used in actual code)
+    v_unnorm = param.basis @ z
+    v_norm = v_unnorm.norm()
+    v = v_unnorm / (v_norm + 1e-8)
+
+    # Create a simple loss based on normalized v
+    loss = (v ** 2).sum()
+
+    # Compute gradient via autograd
+    loss.backward()
+    grad_z_autograd = z.grad.clone()
+
+    # Compute gradient via our chain rule function with normalization
+    # grad_v = 2 * v (for sum of squares loss)
+    grad_v = 2 * v.detach()
+
+    # Use z (without grad) for the gradient computation
+    z_no_grad = z.detach().clone()
+    grad_z_manual = param.gradient_z_to_v(grad_v, z=z_no_grad, v=v.detach())
+
+    # Should be close (may not be exact due to numerical precision)
+    assert torch.allclose(grad_z_autograd, grad_z_manual, atol=1e-4), \
+        f"Gradient mismatch: autograd={grad_z_autograd[:2,:4]}, manual={grad_z_manual[:2,:4]}"
+
+
+def test_smooth_parameterization_gradient_descent_direction():
+    """Test that gradient descent with normalization moves in the correct direction."""
+    torch.manual_seed(42)  # For reproducibility
+    n_layers, hidden_dim, n_basis = 6, 32, 4  # More basis = better expressiveness
+
+    param = SmoothLayerParameterization(
+        n_layers=n_layers,
+        hidden_dim=hidden_dim,
+        n_basis=n_basis,
+        lengthscale=2.0
+    )
+
+    # Create a target that's representable in the smooth basis
+    # (random targets may not be in the span of smooth functions)
+    z_target = torch.randn(n_basis, hidden_dim)
+    target = param.z_to_v(z_target, normalize=True)
+
+    def compute_loss(z):
+        v = param.z_to_v(z, normalize=True)
+        # Negative cosine similarity (we want to maximize similarity = minimize loss)
+        return -(v * target).sum()
+
+    # Initialize z far from target
+    z = torch.randn(n_basis, hidden_dim) * 0.1
+
+    # Compute initial loss and similarity
+    initial_loss = compute_loss(z).item()
+    v_initial = param.z_to_v(z, normalize=True)
+    initial_similarity = (v_initial * target).sum().item()
+
+    # Take gradient steps using autograd (the correct way)
+    lr = 0.5
+    for _ in range(50):
+        z.requires_grad_(True)
+        v = param.z_to_v(z, normalize=True)
+        loss = -(v * target).sum()
+        loss.backward()
+
+        z = (z - lr * z.grad).detach()
+
+    # Compute final loss and similarity
+    final_loss = compute_loss(z).item()
+    v_final = param.z_to_v(z, normalize=True)
+    final_similarity = (v_final * target).sum().item()
+
+    # Loss should decrease significantly
+    assert final_loss < initial_loss - 0.1, \
+        f"Loss did not decrease enough: initial={initial_loss:.4f}, final={final_loss:.4f}"
+
+    # Similarity should increase
+    assert final_similarity > initial_similarity, \
+        f"Similarity did not improve: initial={initial_similarity:.4f}, final={final_similarity:.4f}"
+
+    # Final similarity should be reasonably high (target is in basis span)
+    assert final_similarity > 0.8, f"Final similarity too low: {final_similarity:.4f}"

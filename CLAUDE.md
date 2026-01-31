@@ -2,7 +2,7 @@
 
 **Adversarial research project for discovering and manipulating refusal mechanisms in LLMs**
 
-> **Based on:** [The Geometry of Refusal in Large Language Models](The%20Geometry%20of%20Refusal%20in%20Large%20Language%20Models.pdf) (arXiv:2502.17420)
+> **Based on:** [The Geometry of Refusal in Large Language Models](literature/papers/The%20Geometry%20of%20Refusal%20in%20Large%20Language%20Models.pdf) (arXiv:2502.17420)
 
 This repository implements state-of-the-art techniques for:
 1. Discovering the geometric structure of refusal subspaces in language models
@@ -25,12 +25,20 @@ This codebase enables you to:
 - **HarmBench Integration**: Exact 95 standard behaviors from REINFORCE attacks paper for reproducible evaluation
 - **Pareto Optimization**: Multi-objective training that explores (ASR, capability_preservation) frontier
 - **ACE Adapters**: Full affine concept editing adapters with h' = h - β·proj(h) + α·v
+- **Single-vector discovery (recommended)**: New `SingleVectorDiscovery` finds ONE direction v ∈ R^{hidden_dim} that works across ALL layers with ACE ablation. Uses layer-specific baselines: `h'_i = h_i - proj_v(h_i) + proj_v(v⁻_i)`. Search space is just `hidden_dim` instead of `n_layers × hidden_dim`. All r_i directions used as initialization. See `src/discovery/single_vector_discovery.py`.
+- **Single-layer beats multi-layer**: Experiments show single-layer ablation at the best layer (L15) achieves **37% refusal reduction** while multi-layer ablation achieves only **0.8%**. Layers interfere when ablated simultaneously. See `test_single_layer_refusal`.
+- **Modal refactored**: `modal_app.py` is now a thin wrapper importing from `modal_app/` package. Submodules: `config.py`, `utils.py`, `discovery.py`, `evaluation.py`, `pareto.py`, `boundary.py`, `single_layer.py`.
+- **Single-layer discovery**: New `SingleLayerDiscovery` optimizes (direction, layer) pairs jointly instead of full [n_layers, hidden_dim] matrices. Reduces search space from 115k to 4k dimensions. Finds per-layer boundaries and Pareto frontiers. See `src/discovery/single_layer_discovery.py`.
+- **Dynamic boundary threshold**: Threshold now computed as `baseline_refusal - fraction * (baseline_refusal - baseline_harmless)` where `fraction=0.05` (5% of the way from refusal to non-refusal). More meaningful than fixed threshold.
+- **Refusal propagation findings**: Experiments show ~82% of refusal signal at layer i+1 comes from layer i (see `scripts/test_propagation.py`). Ablating r_i changes activations at i+1 almost exclusively in the r_{i+1} direction (cos similarity ~0.97).
+- **Multi-fidelity support**: Scorer now supports `fidelity` parameter for cheap screening (disabled by default). Use `scorer.score(v, fidelity=0.25)` to use 25% of prompts.
+- **Smooth layer parameterization**: Gradient-based search now optimizes in a smooth basis space by default, enforcing GP-consistent layer smoothness and reducing effective dimensionality by ~3.5x. See Key Concepts section 7.
 - **Training consolidation**: All adapter code consolidated into `unified_rdo_adapter.py`. Training uses ACE with 2-pass loss (ablation + addition).
 - **Multi-token KL (RDO-style)**: Optional `--generate-completions --n-kl-tokens 30` computes KL over pregenerated completions, matching the original RDO paper's retain loss
 - **Flexible batch sizes**: Pareto scoring now uses configurable prompt counts via `--n-harmful` and `--n-harmless` (default 32 each, loaded from `data/splits/`)
 - **Three discovery algorithms**: Mode discovery, boundary discovery, and Pareto discovery (see below)
 - **Modal integration**: Run GPU workloads on Modal cloud with `uv run modal run modal_app.py`
-- **Structured GP (default)**: New `gp_type='structured'` models layer dependencies with smoothness + ARD
+- **Structured GP (recommended)**: `gp_type='structured'` models layer dependencies with smoothness + ARD. Note: ParetoDiscoveryConfig defaults to `'simple'`; set `gp_type='structured'` explicitly for better results
 - **Fast scoring**: Pareto discovery uses forward passes only — no generation needed (~0.3s vs ~5s per measurement)
 - New fast CPU tests; run with `uv run pytest -q`. No GPU required.
 
@@ -120,15 +128,16 @@ We use the **exact same dataset** as the REINFORCE attacks paper for reproducibl
 
 ### Discovery Algorithms
 
-We provide **three** discovery approaches for different use cases:
+We provide **four** discovery approaches for different use cases:
 
-| Algorithm | What it finds | Use case |
-|-----------|--------------|----------|
-| **Mode Discovery** | Local maxima of R(v) | Find best ablation directions |
-| **Boundary Discovery** | Level set where R(v) ≈ threshold | Map the refusal region boundary |
-| **Pareto Discovery** | Pareto frontier of (refusal, KL) | Optimal ablation/capability tradeoffs |
+| Algorithm | What it finds | Search space | Use case |
+|-----------|--------------|--------------|----------|
+| **Single-Vector** | One v that works at all layers | R^{hidden_dim} | **Simplest, recommended** |
+| **Pareto Discovery** | Pareto frontier of (refusal, KL) | R^{n_layers × hidden_dim} | Optimal tradeoffs |
+| **Boundary Discovery** | Level set where R(v) ≈ threshold | R^{n_layers × hidden_dim} | Map refusal boundary |
+| **Mode Discovery** | Local maxima of R(v) | R^{n_layers × hidden_dim} | Find best directions |
 
-**Pareto Discovery** (recommended) finds vectors that optimally trade off refusal ablation vs. behavior preservation — no generation needed, just forward passes.
+**Single-Vector Discovery** (recommended) is the simplest: find ONE direction that works everywhere using layer-specific ACE baselines. Experiments show this beats multi-layer ablation due to layer interference.
 
 ## Quick Start
 
@@ -406,18 +415,25 @@ trained_model.save_pretrained("final_adapters")
 #### 3. Evaluate
 
 ```python
-# Load trained adapters
-from peft import PeftModel
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from src.training import get_unified_rdo_model, UnifiedRDOConfig
 
+# Load base model
 model = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3-0.6B",
     torch_dtype=torch.float16,
     device_map="auto"
 )
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-# Load adapters and set to ablation mode
-model = PeftModel.from_pretrained(model, "final_adapters")
-set_operation_mode(model, operation='ablate')
+# Load trained vectors and apply unified RDO transformation
+# The transformation is always active - no mode switching needed
+config = UnifiedRDOConfig(
+    projection_alpha=1.0,  # Full ablation
+    addition_alpha=0.0,    # No addition (pure ablation for evaluation)
+)
+model = get_unified_rdo_model(model, config)
 
 # Test on harmful prompts
 harmful_prompts = [
@@ -426,15 +442,14 @@ harmful_prompts = [
     # ... more
 ]
 
-responses = model.generate(harmful_prompts)
+# Generate responses
+inputs = tokenizer(harmful_prompts, return_tensors="pt", padding=True).to(model.device)
+outputs = model.generate(**inputs, max_new_tokens=100)
+responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-# Evaluate
-from harmbench import HarmBenchClassifier
-
-classifier = HarmBenchClassifier()
-scores = classifier(harmful_prompts, responses)
-
-compliance_rate = (scores > 0.5).mean()
+# Evaluate with your classifier of choice
+# Example: use a simple keyword check or external classifier
+compliance_rate = sum(1 for r in responses if "I cannot" not in r) / len(responses)
 print(f"Compliance rate: {compliance_rate:.1%}")
 # Goal: High compliance (model jailbroken successfully)
 ```
@@ -456,11 +471,14 @@ uv run modal token new
 ### Usage
 
 ```bash
-# Run Pareto discovery (recommended)
-uv run modal run modal_app.py
+# Run single-vector discovery (simplest, recommended)
+uv run modal run modal_app.py::run_single_vector_discovery
+
+# Test single-layer vs multi-layer ablation effectiveness
+uv run modal run modal_app.py::test_single_layer_refusal
 
 # Or run specific functions
-uv run modal run modal_app.py::run_pareto_discovery --n_init_samples 30 --n_pareto_iterations 70
+uv run modal run modal_app.py::run_pareto_discovery --n-init-samples 30 --n-pareto-iterations 70
 uv run modal run modal_app.py::run_discovery  # Mode discovery
 uv run modal run modal_app.py::run_evaluation --prompts '["How to hack?"]'
 ```
@@ -618,24 +636,30 @@ uv run python scripts/run_pareto.py --high-budget --n-harmful 64 --n-harmless 64
 
 ## Repository Structure
 
-See **[STRUCTURE.md](STRUCTURE.md)** for detailed directory layout and navigation guide.
-
 ### Quick Overview
 
 ```
 refusal-cones/
 ├── src/                   # Core implementations
-│   ├── discovery/        # Geometry discovery (gradient_discovery.py, etc.)
+│   ├── discovery/        # Geometry discovery
+│   │   ├── single_vector_discovery.py  # RECOMMENDED: single v for all layers
+│   │   ├── pareto_boundary_discovery.py
+│   │   └── ...
 │   ├── training/         # Training modules
 │   │   ├── adapters/    # unified_rdo_adapter.py (ACE implementation)
 │   │   └── trainers/    # unified_rdo_trainer.py, RL trainers
 │   ├── measurement/      # Evaluation (vllm_hybrid_measurement.py, etc.)
 │   └── utils/            # Utilities
+├── modal_app/             # Modal cloud GPU package (refactored)
+│   ├── config.py         # App, image, volumes, constants
+│   ├── utils.py          # load_prompts, serialization helpers
+│   ├── discovery.py      # run_discovery
+│   ├── evaluation.py     # run_evaluation, run_batch_evaluation
+│   ├── pareto.py         # run_pareto_discovery, run_high_budget_discovery
+│   ├── boundary.py       # run_boundary_then_pareto, run_boundary_only
+│   └── single_layer.py   # run_single_vector_discovery, test_single_layer_refusal
+├── modal_app.py           # Thin wrapper importing from modal_app/
 ├── docs/                  # All documentation
-│   ├── setup/            # Getting started guides
-│   ├── discovery/        # Discovery methods
-│   ├── training/         # Training guides
-│   └── integrations/     # Third-party integrations
 ├── examples/              # Example scripts
 ├── tests/                 # Test suite
 ├── scripts/               # Utility scripts
@@ -645,8 +669,9 @@ refusal-cones/
 ### Core Modules
 
 **Discovery** (in `src/discovery/`):
-- `gradient_discovery.py` - Gradient-based discovery (RECOMMENDED)
-- `pareto_boundary_discovery.py` - Pareto frontier discovery (RECOMMENDED for multi-objective)
+- `single_vector_discovery.py` - **RECOMMENDED**: Single vector for all layers with ACE
+- `pareto_boundary_discovery.py` - Pareto frontier discovery (multi-objective)
+- `gradient_discovery.py` - Gradient-based discovery
 - `adaptive_geometry_discovery.py` - Base GP implementation with three GP types:
   - `StructuredLayerGP` - Layer smoothness + ARD (default, recommended)
   - `AdaptiveSparseGP` - Sparse inducing points for scaling
@@ -731,7 +756,7 @@ v = v / ||v||                       # Retract to sphere
 
 ### 5. Affine Concept Editing (ACE)
 
-Based on ["Refusal in LLMs is an Affine Function"](affine_refusal.pdf) (Marshall et al., 2024), we implement the ACE formula for ablation:
+Based on ["Refusal in LLMs is an Affine Function"](literature/papers/affine_refusal.pdf) (Marshall et al., 2024), we implement the ACE formula for ablation:
 
 ```
 h' = h - proj_v(h) + proj_v(v⁻) + α*v
@@ -746,6 +771,8 @@ Where:
 - `proj_v(x) = (x·v̂)v̂` where `v̂ = v/||v||`
 
 **Key insight**: The bias term `proj_v(v⁻)` keeps activations in a sensible region of activation space. Without it, simple directional ablation can push activations into nonsensical regions.
+
+**Important**: The full ACE formula (with `v⁻` bias) only applies when `use_baseline=True`. By default, `use_baseline=False` uses the simpler formula `h' = h - proj_v(h) + α*v`. When using `use_baseline=True`, you must call `model.fit_all_baselines(harmless_dataloader)` to compute the reference point `v⁻` from harmless activations.
 
 **Data structures:**
 
@@ -827,6 +854,76 @@ Learned layer importance (ARD):
   Layer  0: 0.023   ← early/late layers less important
 ```
 
+### 7. Smooth Layer Parameterization
+
+When using gradient-based candidate generation with `StructuredLayerGP`, there's a potential mismatch: the GP assumes layer smoothness (adjacent layers have correlated directions), but gradient descent can produce non-smooth vectors that violate this prior.
+
+**Solution:** `SmoothLayerParameterization` reparameterizes the optimization to enforce smoothness by construction.
+
+Instead of optimizing `v ∈ R^{n_layers × hidden_dim}` directly, we optimize basis coefficients `z ∈ R^{n_basis × hidden_dim}`:
+
+```
+v(layer_i) = Σ_k z_k * φ_k(layer_i)
+```
+
+Where `φ_k` are RBF basis functions centered at different layers.
+
+**Benefits:**
+- **Enforces smoothness**: Adjacent layers automatically have similar directions
+- **Reduces dimensionality**: From `n_layers × hidden_dim` to `n_basis × hidden_dim` (e.g., 3.5x reduction for 28 layers, 8 basis)
+- **GP consistency**: Gradient descent stays in regions where the GP's predictions are reliable
+
+**Configuration:**
+
+```python
+config = ParetoDiscoveryConfig(
+    use_smooth_parameterization=True,  # Enable (default: True)
+    n_basis=8,                          # Number of RBF basis functions
+    layer_lengthscale=3.0,              # Smoothness (shared with StructuredLayerGP)
+)
+```
+
+**How it works:**
+
+1. **Initialization**: Convert starting vector `v` to basis coefficients `z = basis_pinv @ v`
+2. **Gradient step**:
+   - Forward: `v = basis @ z` (smooth by construction)
+   - Score: Get `grad_v` from model backprop
+   - Chain rule: `grad_z = basis.T @ grad_v`
+   - Update: `z = z - lr * grad_z`
+3. **Output**: Final `v = basis @ z` is guaranteed smooth
+
+**Choosing `n_basis`:**
+- Too few (< 4): Can't represent complex layer patterns
+- Too many (> n_layers/2): Loses smoothness benefit
+- Recommended: 6-12 for 28-layer models
+
+**Disable if needed:**
+
+```python
+config = ParetoDiscoveryConfig(
+    use_smooth_parameterization=False,  # Use original Riemannian gradient descent
+)
+```
+
+**Interaction with Per-Layer Normalization:**
+
+The GP's feature kernel normalizes each layer independently:
+
+```python
+V1_norm = V1 / V1.norm(dim=1, keepdim=True)  # Per-layer normalization
+```
+
+This creates a beneficial interaction with smooth parameterization:
+
+| Component | What it does | Effect |
+|-----------|-------------|--------|
+| Smooth parameterization | Constrains search to smooth vectors | Gradient candidates match GP prior |
+| Layer smoothness kernel | Weights adjacent layer correlations | `K_layer[i,j] = exp(-(i-j)²/2σ²)` |
+| Per-layer normalization | Makes magnitude irrelevant | Removes basis edge effects |
+
+The RBF basis functions slightly concentrate magnitude in middle layers (due to overlapping basis support), but per-layer normalization makes this irrelevant to the GP—it only sees unit vectors at each layer. The key property preserved is **direction smoothness** (~0.97 cosine similarity between adjacent layers), which is what the layer smoothness kernel actually models.
+
 ## Workflows
 
 ### Workflow 1: Discover + Train (Recommended)
@@ -846,19 +943,7 @@ python examples/example_per_layer_training.py
 python examples/example_adversarial_training.py
 ```
 
-### Workflow 2: Visualize Geometry (3D Demo)
-
-```bash
-# Generate visualizations
-python scripts/visualize_geometry.py
-
-# Creates:
-#   - cone_vs_adaptive_3d.png (sampling space comparison)
-#   - geometry_scenarios.png (different geometry types)
-#   - sampling_density.png (density comparison)
-```
-
-### Workflow 3: Compare Methods
+### Workflow 2: Compare Methods
 
 ```bash
 # Compare gradient vs pure GP
