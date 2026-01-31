@@ -66,6 +66,11 @@ class UnifiedRDOConfig:
     enable_rank_k: bool = False
     rank_k: int = 1  # Number of vectors in subspace
 
+    # Multi-dimensional ACE options (for rank-k layers)
+    force_orthogonal: bool = True  # Force orthogonalization (faster, more stable)
+    per_direction_steering: bool = False  # Separate α for each direction (k alphas vs 1)
+    use_baseline: bool = True  # Use ACE baseline restoration v⁻
+
     # Loss weights for training
     lambda_harmful: float = 1.0    # Weight for harmful examples
     lambda_harmless: float = 0.5   # Weight for harmless examples
@@ -207,14 +212,27 @@ class RankKUnifiedLayer(nn.Module):
     """
     Rank-k ACE layer for complex refusal geometries.
 
-    Instead of single direction r, uses k orthogonal directions to define
-    a k-dimensional subspace. This extends ACE for when refusal is not
-    captured by a single direction.
+    Two modes:
 
-    Implements generalized ACE:
-        h' = h - Σᵢ proj_rᵢ(h) + Σᵢ proj_rᵢ(r⁻) + α · mean(rᵢ)
+    1. Orthogonal (force_orthogonal=True, default):
+       h' = h - VV^T(h - v⁻) + V·α
+       where V is orthonormalized via Gram-Schmidt
 
-    Where {r₁, ..., rₖ} are orthogonalized steering directions.
+    2. Non-orthogonal (force_orthogonal=False):
+       h' = h - V(V^T V)^{-1}V^T(h - v⁻) + V·α
+       where V can be arbitrary (uses pseudoinverse projection)
+
+    Args:
+        base_layer: The layer to wrap
+        dim: Hidden dimension
+        rank_k: Number of subspace directions
+        alpha: Initial steering parameter (0 = no refusal, 1 = full refusal)
+        normalize: Whether to normalize vectors (only used if force_orthogonal=True)
+        use_baseline: Use ACE baseline restoration v⁻ (recommended)
+        force_orthogonal: Enforce orthogonality via Gram-Schmidt (faster, more stable)
+        per_direction_steering: Use vector α ∈ R^k instead of scalar (more expressive)
+        projection_alpha: Scaling for projection term (default 1.0)
+        addition_alpha: Scaling for steering term (default 1.0)
     """
 
     def __init__(
@@ -223,14 +241,24 @@ class RankKUnifiedLayer(nn.Module):
         dim: int,
         rank_k: int = 3,
         alpha: float = 0.0,
-        normalize: bool = True
+        normalize: bool = True,
+        use_baseline: bool = True,
+        force_orthogonal: bool = True,
+        per_direction_steering: bool = False,
+        projection_alpha: float = 1.0,
+        addition_alpha: float = 1.0
     ):
         super().__init__()
 
         self.base_layer = base_layer
         self.rank_k = rank_k
-        self._alpha = alpha
         self.normalize = normalize
+        self.use_baseline = use_baseline
+        self.force_orthogonal = force_orthogonal
+        self.per_direction_steering = per_direction_steering
+        self.projection_alpha = projection_alpha
+        self.addition_alpha = addition_alpha
+        self._init_alpha = alpha  # Store initial alpha for the property
 
         # Freeze base layer
         for param in base_layer.parameters():
@@ -241,16 +269,20 @@ class RankKUnifiedLayer(nn.Module):
             torch.randn(rank_k, dim) * 0.01
         )
 
-        # Baseline (mean harmless activation)
+        # ACE baseline (v⁻): mean harmless activations
+        # Registered as buffer (not trained, computed from data)
+        self.register_buffer('v_minus', torch.zeros(dim))
+        # Alias for backward compatibility
         self.register_buffer('r_minus', torch.zeros(dim))
+        self._baseline_fitted = False
 
-    @property
-    def alpha(self) -> float:
-        return self._alpha
-
-    @alpha.setter
-    def alpha(self, value: float):
-        self._alpha = value
+        # Per-direction steering coefficients (trainable)
+        if per_direction_steering:
+            # Vector α ∈ R^k (one per direction)
+            self.alpha = nn.Parameter(torch.zeros(rank_k))
+        else:
+            # Scalar α (scaled v_mean)
+            self.alpha = nn.Parameter(torch.tensor(0.0))
 
     def get_orthonormal_basis(self):
         """
@@ -278,12 +310,67 @@ class RankKUnifiedLayer(nn.Module):
 
         return torch.stack(ortho_vectors)
 
+    def _project_orthogonal(self, h: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        """
+        Orthogonal projection: P_V(h) = VV^T h
+
+        Args:
+            h: Input [..., dim]
+            V: Orthonormal basis [k, dim]
+
+        Returns:
+            Projection [..., dim]
+        """
+        # V^T h
+        VT_h = torch.einsum('kd,...d->...k', V, h)  # [..., k]
+
+        # V (V^T h)
+        proj = torch.einsum('...k,kd->...d', VT_h, V)  # [..., dim]
+
+        return proj
+
+    def _project_pseudoinverse(self, h: torch.Tensor, V: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """
+        Pseudoinverse projection: P_V(h) = V(V^T V)^{-1}V^T h
+
+        Args:
+            h: Input [..., dim]
+            V: Arbitrary basis [k, dim] (not necessarily orthogonal)
+            eps: Regularization for numerical stability
+
+        Returns:
+            Projection [..., dim]
+        """
+        # Gram matrix G = V V^T
+        G = V @ V.T  # [k, k]
+
+        # Regularize and invert
+        G_reg = G + eps * torch.eye(G.shape[0], device=G.device, dtype=G.dtype)
+        G_inv = torch.linalg.inv(G_reg)  # [k, k]
+
+        # Compute coefficients: (V^T V)^{-1} V^T h
+        VT_h = torch.einsum('kd,...d->...k', V, h)  # [..., k]
+        coeffs = torch.einsum('...k,kj->...j', VT_h, G_inv)  # [..., k]
+
+        # Project back: V · coeffs
+        proj = torch.einsum('...k,kd->...d', coeffs, V)  # [..., dim]
+
+        return proj
+
     def forward(self, x, *args, **kwargs):
         """
         Forward with rank-k ACE transformation.
 
-        h' = h - Σᵢ proj_rᵢ(h) + Σᵢ proj_rᵢ(r⁻) + α · mean(rᵢ)
+        Computes:
+            If use_baseline:
+                h' = h - P_V(h - v⁻) + steering
+            Else:
+                h' = h - P_V(h) + steering
+
+        Where P_V is orthogonal or pseudoinverse projection.
         """
+        import warnings
+
         # Base layer forward
         result = self.base_layer(x, *args, **kwargs)
 
@@ -295,55 +382,151 @@ class RankKUnifiedLayer(nn.Module):
             h = result
             extra_outputs = None
 
-        # Get orthonormal basis
-        basis = self.get_orthonormal_basis()  # [k, dim]
+        # Get basis (orthogonal or not)
+        if self.force_orthogonal:
+            V = self.get_orthonormal_basis()  # [k, dim]
+        else:
+            V = self.subspace_vectors  # [k, dim] (raw, possibly non-orthogonal)
 
-        # Apply ACE for each direction in subspace
-        h_prime = h
-        for r_hat in basis:
-            # proj_r(h)
-            proj_h = torch.einsum('...d,d->...', h_prime, r_hat)
-            proj_h = torch.einsum('...,d->...d', proj_h, r_hat)
+        # Compute what to project
+        if self.use_baseline:
+            if not self._baseline_fitted:
+                warnings.warn(
+                    "Baseline (v_minus) not fitted but use_baseline=True. "
+                    "Using zero vector. Call fit_baseline() or fit_from_activations() first.",
+                    UserWarning
+                )
+            delta = h - self.v_minus  # [..., dim]
+        else:
+            delta = h
 
-            # proj_r(r⁻)
-            proj_r_minus = (self.r_minus @ r_hat) * r_hat
+        # Project using appropriate method
+        if self.force_orthogonal:
+            proj_delta = self._project_orthogonal(delta, V)
+        else:
+            proj_delta = self._project_pseudoinverse(delta, V)
 
-            # Remove projection, add baseline projection
-            h_prime = h_prime - proj_h + proj_r_minus
+        # Remove projection (with scaling)
+        h_prime = h - self.projection_alpha * proj_delta
 
-        # Add steering: α · mean(basis)
-        r_mean = self.subspace_vectors.mean(dim=0)  # Use unnormalized mean
-        h_prime = h_prime + self._alpha * r_mean
+        # Add steering term
+        if self.per_direction_steering:
+            # V·α where α ∈ R^k
+            steering = torch.einsum('k,kd->d', self.alpha, V)  # [dim]
+        else:
+            # α·mean(V) where α is scalar
+            v_mean = V.mean(dim=0)  # [dim]
+            steering = self.alpha * v_mean  # [dim]
+
+        h_prime = h_prime + self.addition_alpha * steering
 
         # Reconstruct output
         if extra_outputs is not None:
             return (h_prime,) + extra_outputs
         return h_prime
 
+    def fit_baseline(self, harmless_activations: torch.Tensor):
+        """
+        Fit ACE baseline v⁻ from harmless data only.
+
+        Args:
+            harmless_activations: Activations on harmless prompts [n_samples, dim]
+        """
+        with torch.no_grad():
+            baseline = harmless_activations.mean(dim=0)
+            self.v_minus.copy_(baseline)
+            self.r_minus.copy_(baseline)  # Keep in sync for backward compat
+            self._baseline_fitted = True
+
+    def initialize_from_mean_diff(
+        self,
+        harmful_activations: torch.Tensor,
+        harmless_activations: torch.Tensor,
+        noise_std: float = 0.01
+    ):
+        """
+        Initialize subspace vectors from mean difference + noise.
+
+        Creates k vectors by adding small random noise to the mean difference
+        direction. This provides a good starting point for discovering the
+        refusal subspace.
+
+        Args:
+            harmful_activations: Activations on harmful prompts [n_samples, dim]
+            harmless_activations: Activations on harmless prompts [n_samples, dim]
+            noise_std: Standard deviation of noise to add (default: 0.01)
+        """
+        with torch.no_grad():
+            # Compute mean difference (primary refusal direction)
+            mean_diff = harmful_activations.mean(dim=0) - harmless_activations.mean(dim=0)
+            mean_diff_norm = mean_diff / (mean_diff.norm() + 1e-8)  # Normalize
+
+            # Create k vectors with small perturbations
+            for i in range(self.rank_k):
+                noise = torch.randn_like(mean_diff_norm) * noise_std
+                perturbed = mean_diff_norm + noise
+                perturbed = perturbed / (perturbed.norm() + 1e-8)  # Normalize
+                self.subspace_vectors.data[i] = perturbed
+
+            # Also fit baseline if enabled
+            if self.use_baseline:
+                self.fit_baseline(harmless_activations)
+
     def fit_from_activations(
         self,
         harmless_activations: torch.Tensor,
-        harmful_activations: torch.Tensor
+        harmful_activations: torch.Tensor,
+        noise_std: float = 0.01
     ):
         """
         Fit baseline and initialize subspace from activation data.
 
+        Convenience method that calls both fit_baseline and initialize_from_mean_diff.
+
         Args:
             harmless_activations: [n_samples, dim]
             harmful_activations: [n_samples, dim]
+            noise_std: Standard deviation of noise to add (default: 0.01)
         """
-        r_minus = harmless_activations.mean(dim=0)
-        r_plus = harmful_activations.mean(dim=0)
-        r = r_plus - r_minus
+        # Fit baseline
+        self.fit_baseline(harmless_activations)
 
-        self.r_minus.copy_(r_minus)
+        # Initialize vectors from mean diff
+        with torch.no_grad():
+            mean_diff = harmful_activations.mean(dim=0) - harmless_activations.mean(dim=0)
+            mean_diff_norm = mean_diff / (mean_diff.norm() + 1e-8)
 
-        # Initialize first vector to mean difference
-        self.subspace_vectors.data[0] = r
+            for i in range(self.rank_k):
+                noise = torch.randn_like(mean_diff_norm) * noise_std
+                perturbed = mean_diff_norm + noise
+                perturbed = perturbed / (perturbed.norm() + 1e-8)
+                self.subspace_vectors.data[i] = perturbed
 
         print(f"  Fitted rank-{self.rank_k} ACE:")
-        print(f"    ||r|| = {r.norm().item():.4f}")
-        print(f"    ||r⁻|| = {r_minus.norm().item():.4f}")
+        print(f"    ||mean_diff|| = {mean_diff.norm().item():.4f}")
+        print(f"    ||v⁻|| = {self.v_minus.norm().item():.4f}")
+        if not self.force_orthogonal:
+            cond = self.get_condition_number()
+            print(f"    Condition number: {cond:.2f}")
+
+    def get_condition_number(self) -> float:
+        """
+        Get condition number of Gram matrix V^T V.
+
+        Useful for monitoring numerical stability in non-orthogonal mode.
+        High condition number (> 100) indicates near-linear dependence.
+
+        Returns:
+            Condition number (1.0 for orthogonal, higher for non-orthogonal)
+        """
+        V = self.subspace_vectors  # [k, dim]
+        G = V @ V.T  # [k, k]
+
+        # Condition number = largest_eigenvalue / smallest_eigenvalue
+        eigenvalues = torch.linalg.eigvalsh(G)
+        cond = eigenvalues.max() / (eigenvalues.min() + 1e-10)
+
+        return cond.item()
 
 
 class UnifiedRDOModel(nn.Module):
@@ -435,7 +618,10 @@ class UnifiedRDOModel(nn.Module):
                     dim=dim,
                     rank_k=self.config.rank_k,
                     alpha=self.config.alpha,
-                    normalize=self.config.normalize_vectors
+                    normalize=self.config.normalize_vectors,
+                    use_baseline=self.config.use_baseline,
+                    force_orthogonal=self.config.force_orthogonal,
+                    per_direction_steering=self.config.per_direction_steering
                 )
             else:
                 wrapped = UnifiedRDOLayer(
@@ -639,6 +825,34 @@ class UnifiedRDOModel(nn.Module):
         print("\nSteering directions (r) initialized to mean difference.")
         print("Baselines (r⁻) set from harmless activations.")
         print("Ready for training!")
+
+    def get_all_condition_numbers(self) -> List[float]:
+        """
+        Get condition numbers for all rank-k layers.
+
+        Useful for monitoring numerical stability when using non-orthogonal vectors.
+        High condition number (> 100) indicates near-linear dependence.
+
+        Returns:
+            List of condition numbers (one per rank-k layer)
+        """
+        if not self.config.enable_rank_k:
+            raise ValueError("This method only works with rank-k layers (enable_rank_k=True)")
+
+        cond_numbers = []
+        if hasattr(self.base_model, 'model'):
+            layers = self.base_model.model.layers
+        elif hasattr(self.base_model, 'transformer'):
+            layers = self.base_model.transformer.h
+        else:
+            raise ValueError("Unsupported model architecture")
+
+        for layer in layers:
+            if isinstance(layer, RankKUnifiedLayer):
+                cond = layer.get_condition_number()
+                cond_numbers.append(cond)
+
+        return cond_numbers
 
     def save_pretrained(self, save_directory: str):
         """Save ACE adapters (steering directions and baselines)."""
