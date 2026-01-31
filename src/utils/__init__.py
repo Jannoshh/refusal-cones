@@ -19,6 +19,7 @@ from .data_utils import (
     prepare_rdo_datasets,
     format_prompt_for_model
 )
+from .mean_difference import compute_mean_difference_vector
 
 __all__ = [
     'HookedModel',
@@ -35,5 +36,6 @@ __all__ = [
     'load_cb_harmful_train',
     'load_harmless_data',
     'prepare_rdo_datasets',
-    'format_prompt_for_model'
+    'format_prompt_for_model',
+    'compute_mean_difference_vector'
 ]

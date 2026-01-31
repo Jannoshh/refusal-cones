@@ -31,6 +31,7 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from training.trainers.per_layer_training import PerLayerRefusalVectors
+from utils.mean_difference import compute_mean_difference_vector
 
 # Add experiments to path for judge
 sys.path.insert(0, str(Path(__file__).parent.parent / "experiments"))
@@ -374,86 +375,6 @@ class REINFORCEVectorOptimizer:
                 print(f"  Loss: {stats['loss']:.4f}")
 
         return history
-
-
-def compute_mean_difference_vector(
-    model,
-    tokenizer,
-    harmful_prompts: List[str],
-    harmless_prompts: List[str],
-) -> torch.Tensor:
-    """
-    Compute mean difference vector: mean(harmful_acts) - mean(harmless_acts).
-
-    (Same as in grpo_from_mean_diff.py)
-    """
-    print("\n" + "=" * 70)
-    print("COMPUTING MEAN DIFFERENCE VECTOR")
-    print("=" * 70)
-
-    n_layers = len(model.model.layers)
-    device = next(model.parameters()).device
-
-    # Storage for activations
-    harmful_acts = {i: [] for i in range(n_layers)}
-    harmless_acts = {i: [] for i in range(n_layers)}
-
-    def get_activations(prompts, storage_dict):
-        """Extract last-token activations for all layers."""
-        for prompt in prompts:
-            messages = [{"role": "user", "content": prompt}]
-            formatted = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            inputs = tokenizer(formatted, return_tensors="pt").to(device)
-
-            activations = {}
-            hooks = []
-
-            for layer_idx in range(n_layers):
-                def make_hook(idx):
-                    def hook(module, input, output):
-                        if isinstance(output, tuple):
-                            act = output[0]
-                        else:
-                            act = output
-                        activations[idx] = act[:, -1, :].detach().cpu()
-                    return hook
-
-                h = model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx))
-                hooks.append(h)
-
-            with torch.no_grad():
-                model(**inputs)
-
-            for h in hooks:
-                h.remove()
-
-            for layer_idx in range(n_layers):
-                storage_dict[layer_idx].append(activations[layer_idx])
-
-    print(f"\nExtracting harmful activations ({len(harmful_prompts)} prompts)...")
-    get_activations(harmful_prompts, harmful_acts)
-
-    print(f"Extracting harmless activations ({len(harmless_prompts)} prompts)...")
-    get_activations(harmless_prompts, harmless_acts)
-
-    print("\nComputing mean difference vectors...")
-    vectors = []
-
-    for layer_idx in range(n_layers):
-        mean_harmful = torch.stack(harmful_acts[layer_idx]).mean(dim=0).to(device)
-        mean_harmless = torch.stack(harmless_acts[layer_idx]).mean(dim=0).to(device)
-        diff = mean_harmful - mean_harmless
-        diff = diff / diff.norm()
-        vectors.append(diff)
-
-    vectors = torch.stack(vectors)
-
-    print(f"\n✓ Mean difference vector computed: {vectors.shape}")
-    return vectors
 
 
 def main():
