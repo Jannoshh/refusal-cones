@@ -185,7 +185,9 @@ def measure_refusal_with_grad(v: torch.Tensor) -> tuple:
     v.requires_grad = True
 
     # Apply ablation with v
-    model_ablated = apply_projection(model, v)
+    from src.utils import apply_projection
+
+    model_ablated = apply_projection(model, v, operation="ablate")
 
     # Test on harmful prompts
     responses = model_ablated.generate(harmful_prompts)
@@ -270,24 +272,21 @@ if results['geometry']['intrinsic_dimension'] <= 10:
     model = get_cone_model(
         base_model,
         cone_rank=len(results['modes']),
-        init_vectors=results['modes'],  # Initialize from discovery!
-        target_modules=["self_attn.o_proj"]  # Apply to attention outputs
+        target_modules=["layers"],
+        init_vectors=results['modes']  # Initialize from discovery!
     )
 else:
     # Complex geometry → use standard RDO
     print("Using standard RDO (single vector per layer)")
 
     config = RDOConfig(
-        target_modules=["self_attn.o_proj"],
+        target_modules=["layers"],
         operation='both',  # Ablation + addition
         projection_alpha=1.0,
         addition_alpha=1.0
     )
 
     model = get_rdo_model(base_model, config)
-
-    # Initialize from first discovered mode
-    initialize_from_discovery(model, results['modes'][0])
 
 # Prepare data
 harmful_data = load_harmful_dataset()  # Your harmful examples
@@ -318,7 +317,7 @@ trained_model.save_pretrained("final_adapters")
 
 ```python
 # Load trained adapters
-from peft import PeftModel
+from src.training import RDOModel
 
 model = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3-0.6B",
@@ -327,8 +326,8 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 # Load adapters and set to ablation mode
-model = PeftModel.from_pretrained(model, "final_adapters")
-set_operation_mode(model, operation='ablate')
+model = RDOModel.from_pretrained(model, "final_adapters")
+model.set_operation('ablate')
 
 # Test on harmful prompts
 harmful_prompts = [
@@ -489,7 +488,6 @@ refusal-cones/
 from src.discovery import (
     GradientGeometryDiscovery,
     GradientDiscoveryConfig,
-    run_discovery_pipeline
 )
 
 # Training
@@ -507,9 +505,11 @@ from src.measurement import (
 
 # Utils
 from src.utils import (
-    load_model,
-    apply_projection_hook,
-    generate_with_projection
+    HookedModel,
+    get_layer_activations,
+    apply_intervention_to_layers,
+    generate_completions,
+    apply_projection,
 )
 ```
 

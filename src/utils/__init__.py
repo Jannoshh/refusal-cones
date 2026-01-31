@@ -1,6 +1,11 @@
 """Utility functions for model handling and generation."""
 
-from .model_utils import HookedModel, get_layer_activations, apply_intervention_to_layers
+from .model_utils import (
+    HookedModel,
+    get_layer_activations,
+    apply_intervention_to_layers,
+    apply_projection,
+)
 from .generate_utils import (
     projection_einops,
     generate_completions,
@@ -25,6 +30,7 @@ __all__ = [
     'HookedModel',
     'get_layer_activations',
     'apply_intervention_to_layers',
+    'apply_projection',
     'projection_einops',
     'generate_completions',
     'intervene_with_fn_vector_ablation',

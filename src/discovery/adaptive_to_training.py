@@ -177,9 +177,9 @@ def adaptive_discovery_to_training_pipeline(
         print("  Initializing single vectors from first principal direction...")
         principal_dir = geometry['principal_directions'][0]
         for i, module in enumerate(model.modules()):
-            if hasattr(module, 'projection_vector'):
+            if hasattr(module, 'vector'):
                 with torch.no_grad():
-                    module.projection_vector.data = principal_dir[i].to(module.projection_vector.device)
+                    module.vector.data = principal_dir[i].to(module.vector.device)
 
     # ========================================================================
     # PHASE 4: TRAIN WITH RDO

@@ -9,6 +9,8 @@ from typing import Callable, Optional, List, Dict, Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from contextlib import contextmanager
 
+from .conversion_utils import convert_model_to_vector_modified
+
 
 class HookedModel:
     """
@@ -331,3 +333,28 @@ def apply_intervention_to_layers(model, prompts, intervention_fn, batch_size=8):
         all_outputs.append(outputs)
 
     return all_outputs
+
+
+def apply_projection(model, vectors, operation: str = "ablate", alpha: float = 1.0, freeze_base: bool = True):
+    """
+    Return a copy of the model with per-layer projection/addition applied.
+
+    Args:
+        model: Base causal LM
+        vectors: Tensor [n_layers, hidden_dim] of steering directions
+        operation: 'ablate' (projection) or 'add' (addition)
+        alpha: Scaling for addition
+        freeze_base: Whether to freeze the base model parameters
+
+    Returns:
+        Model wrapped with VectorModifiedLayer performing the specified operation.
+    """
+
+    op = "ablation" if operation == "ablate" else "addition"
+    return convert_model_to_vector_modified(
+        model=model,
+        vectors=vectors,
+        operation=op,
+        alpha=alpha,
+        freeze_base=freeze_base,
+    )
