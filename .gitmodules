@@ -1,0 +1,3 @@
+[submodule "external/reinforce-attacks-llms"]
+	path = external/reinforce-attacks-llms
+	url = https://github.com/sigeisler/reinforce-attacks-llms.git
