@@ -36,9 +36,12 @@ Instead of assuming refusal is a simple cone (linear subspace), we:
 ### Installation
 
 ```bash
-# Clone the repository
-git clone <repo-url>
+# Clone the repository (include submodules)
+git clone --recurse-submodules https://github.com/Jannoshh/refusal-cones.git
 cd refusal-cones
+
+# If you already cloned without submodules, initialize them:
+git submodule update --init --recursive
 
 # Create and activate virtual environment with uv
 uv venv
