@@ -1,3 +1,6 @@
+[submodule "external/reinforce-attacks-llms"]
+	path = external/reinforce-attacks-llms
+	url = https://github.com/sigeisler/reinforce-attacks-llms.git
 [submodule "refusal_direction"]
 	path = refusal_direction
 	url = https://github.com/andyrdt/refusal_direction

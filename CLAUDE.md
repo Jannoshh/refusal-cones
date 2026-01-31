@@ -21,6 +21,10 @@ This codebase enables you to:
 4. **Scale Efficiently** - Use PEFT adapters instead of custom implementations (97% less code)
 
 ### Latest updates
+- **REINFORCE RL Training**: New RL-based optimization using REINFORCE (from [Geisler et al. 2025](https://arxiv.org/abs/2502.17254)) with variance-reduced weights and Pareto objective (ASR vs KL)
+- **HarmBench Integration**: Exact 95 standard behaviors from REINFORCE attacks paper for reproducible evaluation
+- **Pareto Optimization**: Multi-objective training that explores (ASR, capability_preservation) frontier
+- **ACE Adapters**: Full affine concept editing adapters with h' = h - β·proj(h) + α·v
 - **Single-vector discovery (recommended)**: New `SingleVectorDiscovery` finds ONE direction v ∈ R^{hidden_dim} that works across ALL layers with ACE ablation. Uses layer-specific baselines: `h'_i = h_i - proj_v(h_i) + proj_v(v⁻_i)`. Search space is just `hidden_dim` instead of `n_layers × hidden_dim`. All r_i directions used as initialization. See `src/discovery/single_vector_discovery.py`.
 - **Single-layer beats multi-layer**: Experiments show single-layer ablation at the best layer (L15) achieves **37% refusal reduction** while multi-layer ablation achieves only **0.8%**. Layers interfere when ablated simultaneously. See `test_single_layer_refusal`.
 - **Modal refactored**: `modal_app.py` is now a thin wrapper importing from `modal_app/` package. Submodules: `config.py`, `utils.py`, `discovery.py`, `evaluation.py`, `pareto.py`, `boundary.py`, `single_layer.py`.
@@ -32,12 +36,95 @@ This codebase enables you to:
 - **Training consolidation**: All adapter code consolidated into `unified_rdo_adapter.py`. Training uses ACE with 2-pass loss (ablation + addition).
 - **Multi-token KL (RDO-style)**: Optional `--generate-completions --n-kl-tokens 30` computes KL over pregenerated completions, matching the original RDO paper's retain loss
 - **Flexible batch sizes**: Pareto scoring now uses configurable prompt counts via `--n-harmful` and `--n-harmless` (default 32 each, loaded from `data/splits/`)
-- **ACE (Affine Concept Editing)**: Implements the affine refusal model from Marshall et al. (2024) - see Key Concepts section below
 - **Three discovery algorithms**: Mode discovery, boundary discovery, and Pareto discovery (see below)
 - **Modal integration**: Run GPU workloads on Modal cloud with `uv run modal run modal_app.py`
 - **Structured GP (recommended)**: `gp_type='structured'` models layer dependencies with smoothness + ARD. Note: ParetoDiscoveryConfig defaults to `'simple'`; set `gp_type='structured'` explicitly for better results
 - **Fast scoring**: Pareto discovery uses forward passes only — no generation needed (~0.3s vs ~5s per measurement)
 - New fast CPU tests; run with `uv run pytest -q`. No GPU required.
+
+### RL Training Methods
+
+We implement two RL approaches for optimizing refusal vectors:
+
+#### REINFORCE (Variance-Reduced)
+Based on ["REINFORCE Adversarial Attacks on Large Language Models"](https://arxiv.org/abs/2502.17254) (Geisler et al., 2025):
+
+```python
+# Variance-reduced weights
+w_i = R_i - mean(R)  # Explicit baseline subtraction
+
+# Policy gradient
+grad = Σ w_i · ∇log π(v_i)
+```
+
+**Key advantage:** Doubles ASR compared to standard GCG on Llama-2/3 models
+
+**Paper results:**
+- Llama-2-7B: 40% (GCG) → **80% (REINFORCE-GCG)**
+- Llama-3-8B: 35% (GCG) → **70% (REINFORCE-GCG)**
+- Llama-3-8B + Circuit Breaker: 2% → **50%** (25× improvement!)
+
+#### GRPO (Group Relative Policy Optimization)
+Based on DeepSeek-R1's training approach:
+
+```python
+# Relative ranking advantages
+A_i = 1.0 - (2.0 * rank_i / (K-1))  # Best = +1, worst = -1
+
+# Policy gradient
+grad = Σ A_i · ∇log π(v_i)
+```
+
+**Key advantage:** Simpler implementation, good for relative comparisons
+
+#### Pareto Optimization (Multi-Objective)
+
+Explores the tradeoff between ASR (attack success) and capability preservation:
+
+```python
+# Multi-objective reward
+reward = λ_ASR · ASR - λ_KL · KL_divergence
+
+# Finds Pareto frontier: maximize ASR while minimizing capability damage
+```
+
+**Usage:**
+```bash
+# Standard REINFORCE training
+modal run modal_ace_reinforce_pareto.py
+
+# Explore Pareto frontier
+modal run modal_ace_reinforce_pareto.py --pareto-sweep
+
+# Quick test
+modal run modal_ace_reinforce_pareto.py --quick
+```
+
+**Expected results on Gemma-2-2B:**
+- Baseline (mean diff): ~70% ASR
+- After REINFORCE (100 steps): ~85% ASR (+15%)
+- KL divergence: <0.5 (low capability damage)
+
+### Evaluation Dataset (HarmBench)
+
+We use the **exact same dataset** as the REINFORCE attacks paper for reproducible comparisons:
+
+- **Source:** HarmBench test set (indices 0-199)
+- **Total behaviors:** 200
+- **Standard behaviors:** 95 (filtered: no copyright, no contextual)
+- **Categories:**
+  - illegal (37 behaviors)
+  - misinformation_disinformation (34)
+  - cybercrime_intrusion (32)
+  - chemical_biological (21)
+  - harassment_bullying (15)
+  - harmful (10)
+
+**Files:**
+- `data/harmbench/harmbench_test_200.json` - All 200 behaviors
+- `data/harmbench/harmbench_test_standard.json` - 95 standard behaviors
+
+**Judge:** HarmBench-Llama-2-13b-cls (same as paper)
 
 ### Discovery Algorithms
 
