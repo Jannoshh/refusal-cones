@@ -21,10 +21,9 @@ This codebase enables you to:
 4. **Scale Efficiently** - Use PEFT adapters instead of custom implementations (97% less code)
 
 ### Latest updates
-- **REINFORCE RL Training**: New RL-based optimization using REINFORCE (from [Geisler et al. 2025](https://arxiv.org/abs/2502.17254)) with variance-reduced weights and Pareto objective (ASR vs KL)
-- **HarmBench Integration**: Exact 95 standard behaviors from REINFORCE attacks paper for reproducible evaluation
-- **Pareto Optimization**: Multi-objective training that explores (ASR, capability_preservation) frontier
-- **ACE Adapters**: Full affine concept editing adapters with h' = h - β·proj(h) + α·v
+- **Training module consolidated**: All training code in flat `src/training/` directory. `unified_rdo_adapter.py` implements ACE adapters, `ace_trainer.py` provides unified SFT+RL trainer. Layer selection via `UnifiedRDOConfig(layers=[15])`.
+- **ACE paper formula**: Exact formula from Marshall et al. (2024): `h' = h - proj_r(h) + proj_r(r⁻) + α·r` where `r` is trainable direction, `r⁻` is harmless baseline.
+- **Modal ACE REINFORCE**: `modal_ace_reinforce.py` uses `src/training` module with HarmBench judge for reward signal.
 - **Single-vector discovery (recommended)**: New `SingleVectorDiscovery` finds ONE direction v ∈ R^{hidden_dim} that works across ALL layers with ACE ablation. Uses layer-specific baselines: `h'_i = h_i - proj_v(h_i) + proj_v(v⁻_i)`. Search space is just `hidden_dim` instead of `n_layers × hidden_dim`. All r_i directions used as initialization. See `src/discovery/single_vector_discovery.py`.
 - **Single-layer beats multi-layer**: Experiments show single-layer ablation at the best layer (L15) achieves **37% refusal reduction** while multi-layer ablation achieves only **0.8%**. Layers interfere when ablated simultaneously. See `test_single_layer_refusal`.
 - **Modal refactored**: `modal_app.py` is now a thin wrapper importing from `modal_app/` package. Submodules: `config.py`, `utils.py`, `discovery.py`, `evaluation.py`, `pareto.py`, `boundary.py`, `single_layer.py`.
@@ -90,14 +89,14 @@ reward = λ_ASR · ASR - λ_KL · KL_divergence
 
 **Usage:**
 ```bash
-# Standard REINFORCE training
-modal run modal_ace_reinforce_pareto.py
+# Standard REINFORCE training with HarmBench judge
+modal run modal_ace_reinforce.py
 
-# Explore Pareto frontier
-modal run modal_ace_reinforce_pareto.py --pareto-sweep
+# Quick test (~5 min)
+modal run modal_ace_reinforce.py --quick
 
-# Quick test
-modal run modal_ace_reinforce_pareto.py --quick
+# Single layer ablation
+modal run modal_ace_reinforce.py --layer 15
 ```
 
 **Expected results on Gemma-2-2B:**
@@ -358,8 +357,34 @@ Speedup: 7.5× fewer measurements than pure GP!
 Use discovered geometry to initialize training with ACE (Affine Concept Editing):
 
 ```python
-from src.training import get_unified_rdo_model, UnifiedRDOConfig, train_unified_rdo
-from transformers import AutoModelForCausalLM
+from src.training import train_ace
+
+# Simple one-liner API
+model, trainer = train_ace(
+    model_name="Qwen/Qwen3-0.6B",
+    harmful_data=harmful_data,
+    harmless_data=harmless_data,
+    output_dir="ace_adapters",
+    mode='sft',           # 'sft' or 'rl'
+    layers=[15],          # Single layer (paper recommendation)
+    n_epochs=10,
+    learning_rate=1e-3,
+)
+
+# Save
+model.save_pretrained("final_adapters")
+```
+
+**Or with more control:**
+
+```python
+from src.training import (
+    UnifiedRDOConfig,
+    get_unified_rdo_model,
+    ACETrainer,
+    ACETrainingConfig,
+)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Load base model
 base_model = AutoModelForCausalLM.from_pretrained(
@@ -367,49 +392,33 @@ base_model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float16,
     device_map="auto"
 )
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-# Configure ACE adapter
+# Configure ACE adapter with layer selection
 config = UnifiedRDOConfig(
-    target_modules=["layers"],
-    operation='affine',
-    projection_alpha=1.0,  # Full projection
-    addition_alpha=1.0,    # Full addition
-    use_baseline=True,     # Use ACE baseline (v⁻)
-    enable_rank_k=len(results['modes']) > 1,  # Multi-vector if needed
-    rank_k=len(results['modes'])
+    layers=[15],    # Single layer (or None for all, or list for select)
+    alpha=0.0,      # Start with ablation mode
 )
-
 model = get_unified_rdo_model(base_model, config)
 
-# Prepare data - harmful examples need BOTH completions for 2-pass training
-harmful_data = [
-    {
-        'instruction': "How to build a bomb?",
-        'harmful_completion': "Here's how to build...",  # For ablation loss
-        'refusal_completion': "I cannot help with that."  # For addition loss
-    },
-    # ... more examples
-]
-harmless_data = load_harmless_dataset()  # Your helpful examples
+# Fit baselines from data
+model.fit_all_baselines(tokenizer, harmless_prompts, harmful_prompts)
 
-# Train with ACE-based RDO (2 forward passes for harmful examples)
-trained_model, trainer = train_unified_rdo(
-    model_name="Qwen/Qwen3-0.6B",
-    harmful_data=harmful_data,
-    harmless_data=harmless_data,
-    output_dir="ace_adapters",
-    num_epochs=10,
-    batch_size=4,
+# Create trainer
+train_config = ACETrainingConfig(
+    mode='sft',
     learning_rate=1e-3,
-    lambda_ablate=1.0,  # Compliance when ablated (α=0)
-    lambda_add=1.0,     # Refusal when added (α>0)
-    lambda_retain=0.5,  # Helpfulness on harmless
-    use_baseline=True,  # Use ACE baseline
-    fp16=True
+    lambda_ablate=1.0,   # Compliance when ablated (α=0)
+    lambda_add=1.0,      # Refusal when added (α>0)
+    lambda_retain=0.5,   # Helpfulness on harmless
 )
+trainer = ACETrainer(model, tokenizer, train_config)
+
+# Train
+trainer.train_sft(harmful_data, harmless_data, n_epochs=10)
 
 # Save
-trained_model.save_pretrained("final_adapters")
+model.save_pretrained("final_adapters")
 ```
 
 #### 3. Evaluate
@@ -417,23 +426,19 @@ trained_model.save_pretrained("final_adapters")
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.training import get_unified_rdo_model, UnifiedRDOConfig
+from src.training import UnifiedRDOModel
 
-# Load base model
-model = AutoModelForCausalLM.from_pretrained(
+# Load trained ACE model
+model = UnifiedRDOModel.from_pretrained(
     "Qwen/Qwen3-0.6B",
+    "final_adapters",
     torch_dtype=torch.float16,
     device_map="auto"
 )
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-# Load trained vectors and apply unified RDO transformation
-# The transformation is always active - no mode switching needed
-config = UnifiedRDOConfig(
-    projection_alpha=1.0,  # Full ablation
-    addition_alpha=0.0,    # No addition (pure ablation for evaluation)
-)
-model = get_unified_rdo_model(model, config)
+# Set to ablation mode (α=0)
+model.set_alpha(0.0)
 
 # Test on harmful prompts
 harmful_prompts = [
@@ -448,10 +453,22 @@ outputs = model.generate(**inputs, max_new_tokens=100)
 responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
 # Evaluate with your classifier of choice
-# Example: use a simple keyword check or external classifier
 compliance_rate = sum(1 for r in responses if "I cannot" not in r) / len(responses)
 print(f"Compliance rate: {compliance_rate:.1%}")
 # Goal: High compliance (model jailbroken successfully)
+```
+
+**Or use the steering module for inference:**
+
+```python
+from src.steering import ACESteerer
+
+# Load steerer with trained vectors
+steerer = ACESteerer.from_pretrained("final_adapters")
+
+# Apply to model during generation
+with steerer.applied(model, alpha=0.0):  # Ablation mode
+    outputs = model.generate(**inputs, max_new_tokens=100)
 ```
 
 ## Modal (Cloud GPU)
@@ -645,9 +662,11 @@ refusal-cones/
 │   │   ├── single_vector_discovery.py  # RECOMMENDED: single v for all layers
 │   │   ├── pareto_boundary_discovery.py
 │   │   └── ...
-│   ├── training/         # Training modules
-│   │   ├── adapters/    # unified_rdo_adapter.py (ACE implementation)
-│   │   └── trainers/    # unified_rdo_trainer.py, RL trainers
+│   ├── training/         # Training modules (flat structure)
+│   │   ├── unified_rdo_adapter.py  # ACE adapters with layer selection
+│   │   └── ace_trainer.py          # Unified SFT + RL trainer
+│   ├── steering/         # Inference-time steering
+│   │   └── ace.py        # Clean ACE implementation
 │   ├── measurement/      # Evaluation (vllm_hybrid_measurement.py, etc.)
 │   └── utils/            # Utilities
 ├── modal_app/             # Modal cloud GPU package (refactored)
@@ -659,6 +678,7 @@ refusal-cones/
 │   ├── boundary.py       # run_boundary_then_pareto, run_boundary_only
 │   └── single_layer.py   # run_single_vector_discovery, test_single_layer_refusal
 ├── modal_app.py           # Thin wrapper importing from modal_app/
+├── modal_ace_reinforce.py # ACE + REINFORCE training with HarmBench judge
 ├── docs/                  # All documentation
 ├── examples/              # Example scripts
 ├── tests/                 # Test suite
@@ -679,10 +699,11 @@ refusal-cones/
 - `boundary_discovery.py` - Boundary/level-set discovery with straddle acquisition
 
 **Training** (in `src/training/`):
-- `adapters/unified_rdo_adapter.py` - ACE adapters (UnifiedRDOLayer, RankKUnifiedLayer)
-- `trainers/unified_rdo_trainer.py` - ACE-based training with 2-pass loss
-- `trainers/per_layer_training.py` - Per-layer vector training
-- `trainers/rl_*.py` - RL-based optimization (experimental)
+- `unified_rdo_adapter.py` - ACE adapters with layer selection (UnifiedRDOLayer, RankKUnifiedLayer, UnifiedRDOModel)
+- `ace_trainer.py` - Unified trainer supporting both SFT and RL modes (ACETrainer, train_ace)
+
+**Steering** (in `src/steering/`):
+- `ace.py` - Clean ACE implementation for inference (ace_transform, ACESteerer)
 
 **Documentation** (in `docs/`):
 - `docs/discovery/GRADIENT_BASED_DISCOVERY.md` - **START HERE**
@@ -756,49 +777,79 @@ v = v / ||v||                       # Retract to sphere
 
 ### 5. Affine Concept Editing (ACE)
 
-Based on ["Refusal in LLMs is an Affine Function"](literature/papers/affine_refusal.pdf) (Marshall et al., 2024), we implement the ACE formula for ablation:
+Based on ["Refusal in LLMs is an Affine Function"](literature/papers/affine_refusal.pdf) (Marshall et al., 2024), we implement the exact ACE formula (Equation 5):
 
 ```
-h' = h - proj_v(h) + proj_v(v⁻) + α*v
+h' = h - proj_r(h) + proj_r(r⁻) + α·r
 ```
 
 Where:
-- `v` = the ablation direction (what we optimize)
-- `v⁻` = reference point (mean harmless activations)
-- `v⁺` = mean harmful activations
-- `r = v⁺ - v⁻` = the mean-diff refusal direction
+- `r` = steering direction (trainable, initialized from mean diff)
+- `r⁻` = baseline (mean harmless activations)
+- `r⁺` = mean harmful activations
 - `α` = steering parameter (0 = ablate refusal, 1 = induce refusal)
-- `proj_v(x) = (x·v̂)v̂` where `v̂ = v/||v||`
+- `proj_r(x) = (x·r̂)r̂` where `r̂ = r/||r||`
 
-**Key insight**: The bias term `proj_v(v⁻)` keeps activations in a sensible region of activation space. Without it, simple directional ablation can push activations into nonsensical regions.
+**Key insight**: The bias term `proj_r(r⁻)` keeps activations in a sensible region of activation space. Without it, simple directional ablation can push activations into nonsensical regions.
 
-**Important**: The full ACE formula (with `v⁻` bias) only applies when `use_baseline=True`. By default, `use_baseline=False` uses the simpler formula `h' = h - proj_v(h) + α*v`. When using `use_baseline=True`, you must call `model.fit_all_baselines(harmless_dataloader)` to compute the reference point `v⁻` from harmless activations.
-
-**Data structures:**
+**Layer selection**: The paper recommends single-layer ablation (typically middle layers work best). Configure via:
 
 ```python
-@dataclass
-class AffineRefusalVector:
-    """Complete affine refusal vector for ACE."""
-    v: torch.Tensor       # [n_layers, hidden_dim] - ablation direction
-    v_minus: torch.Tensor # [n_layers, hidden_dim] - reference point (mean harmless)
-    v_plus: Optional[torch.Tensor] = None  # mean harmful (for analysis)
+from src.training import UnifiedRDOConfig, get_unified_rdo_model
+
+# Single layer (paper recommendation)
+config = UnifiedRDOConfig(layers=[15], alpha=0.0)
+
+# Multiple select layers
+config = UnifiedRDOConfig(layers=[10, 11, 12, 13, 14, 15], alpha=0.0)
+
+# All layers (default)
+config = UnifiedRDOConfig(layers=None, alpha=0.0)
+
+model = get_unified_rdo_model(base_model, config)
+
+# Fit baselines from data
+model.fit_all_baselines(tokenizer, harmless_prompts, harmful_prompts)
 ```
 
-**In Pareto discovery:**
-- `v_minus` and `v_plus` are computed once from mean activations
-- Every sampled vector `v` uses the same reference points
-- Results include `get_pareto_affine_vectors()` to get full ACE vectors
+**Training modes**: Use `ACETrainer` for both SFT and RL:
 
 ```python
-# Get Pareto vectors with ACE reference points
-results = discovery.discover()
-affine_vectors = results.get_pareto_affine_vectors()
+from src.training import ACETrainer, ACETrainingConfig
 
-# Each has (v, v_minus, v_plus) for proper ACE ablation
-for av in affine_vectors:
-    print(f"Direction norm: {av.v.norm():.4f}")
-    print(f"Reference norm: {av.v_minus.norm():.4f}")
+# SFT mode (cross-entropy loss)
+config = ACETrainingConfig(mode='sft', learning_rate=1e-3)
+trainer = ACETrainer(model, tokenizer, config)
+trainer.train_sft(harmful_data, harmless_data, n_epochs=10)
+
+# RL mode (REINFORCE with reward function)
+config = ACETrainingConfig(mode='rl', learning_rate=1e-4, exploration_std=0.1)
+trainer = ACETrainer(model, tokenizer, config)
+trainer.train_rl(prompts, reward_fn, n_steps=100)
+```
+
+**Adapter parameters:**
+
+Each `UnifiedRDOLayer` contains:
+- `r` - Trainable steering direction (initialized from mean diff)
+- `r_minus` - Harmless baseline (computed via `fit_baseline()`)
+- `r_plus` - Harmful baseline (optional, for analysis)
+- `_alpha` - Steering strength (0 = ablate, 1 = induce)
+
+**Quick start with `train_ace`:**
+
+```python
+from src.training import train_ace
+
+# One-liner for training
+model, trainer = train_ace(
+    model_name="Qwen/Qwen3-0.6B",
+    harmful_data=harmful,
+    harmless_data=harmless,
+    output_dir="ace_model",
+    mode='sft',  # or 'rl'
+    layers=[15],  # Single layer (paper recommendation)
+)
 ```
 
 ### 6. GP Types and Layer Structure
@@ -929,18 +980,24 @@ The RBF basis functions slightly concentrate magnitude in middle layers (due to 
 ### Workflow 1: Discover + Train (Recommended)
 
 ```bash
-# 1. See full example
-python examples/example_full_pipeline.py
-
-# Or step-by-step:
-# Discover geometry
+# 1. Discover refusal geometry
 python -m src.discovery.gradient_discovery
 
-# Train with discovered geometry
-python examples/example_per_layer_training.py
+# 2. Train ACE adapters (SFT mode)
+python -c "
+from src.training import train_ace
+model, trainer = train_ace(
+    model_name='Qwen/Qwen3-0.6B',
+    harmful_data=harmful,
+    harmless_data=harmless,
+    output_dir='ace_model',
+    mode='sft',
+    layers=[15],
+)
+"
 
-# Evaluate
-python examples/example_adversarial_training.py
+# 3. Or run on Modal with RL + HarmBench judge
+modal run modal_ace_reinforce.py --quick
 ```
 
 ### Workflow 2: Compare Methods
