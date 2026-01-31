@@ -180,14 +180,18 @@ def train_ace_with_reinforce(
     print("ACE ADAPTER TRAINING WITH REINFORCE + HARMBENCH JUDGE")
     print("=" * 70)
 
+    # Token limits (from paper): 128 for training efficiency, 512 for evaluation
+    train_max_tokens = 128
+    eval_max_tokens = 512
+
     if quick_mode:
         n_steps = 20
         n_train_behaviors = 10
         n_eval_behaviors = 10
-        max_tokens = 100
+        train_max_tokens = 64  # Even shorter for quick test
+        eval_max_tokens = 100
         print("\n🚀 QUICK MODE")
     else:
-        max_tokens = 512
         print("\n⚡ STANDARD MODE")
 
     target_model_name = "google/gemma-2-2b-it"
@@ -304,7 +308,7 @@ def train_ace_with_reinforce(
     print("=" * 70)
 
     eval_prompts = [b["instruction"] for b in eval_behaviors]
-    baseline_gens = trainer._generate(eval_prompts, max_tokens)
+    baseline_gens = trainer._generate(eval_prompts, eval_max_tokens)
     baseline_scores = judge.score(eval_prompts, baseline_gens)
     baseline_asr = baseline_scores.mean().item()
 
@@ -329,7 +333,7 @@ def train_ace_with_reinforce(
         prompts=harmful_prompts,
         reward_fn=reward_fn,
         n_steps=n_steps,
-        max_new_tokens=max_tokens,
+        max_new_tokens=train_max_tokens,  # 128 tokens for training efficiency
         verbose=True
     )
 
@@ -338,7 +342,7 @@ def train_ace_with_reinforce(
     print("FINAL EVALUATION")
     print("=" * 70)
 
-    final_gens = trainer._generate(eval_prompts, max_tokens)
+    final_gens = trainer._generate(eval_prompts, eval_max_tokens)  # 512 tokens for evaluation
     final_scores = judge.score(eval_prompts, final_gens)
     final_asr = final_scores.mean().item()
     improvement = final_asr - baseline_asr
