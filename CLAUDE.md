@@ -41,55 +41,44 @@ This codebase enables you to:
 - **Fast scoring**: Pareto discovery uses forward passes only — no generation needed (~0.3s vs ~5s per measurement)
 - New fast CPU tests; run with `uv run pytest -q`. No GPU required.
 
-### RL Training Methods
+### Training Methods
 
-We implement two RL approaches for optimizing refusal vectors:
+We implement two training approaches for ACE adapters:
 
-#### REINFORCE (Variance-Reduced)
-Based on ["REINFORCE Adversarial Attacks on Large Language Models"](https://arxiv.org/abs/2502.17254) (Geisler et al., 2025):
+#### RDO (SFT-based)
 
-```python
-# Variance-reduced weights
-w_i = R_i - mean(R)  # Explicit baseline subtraction
-
-# Policy gradient
-grad = Σ w_i · ∇log π(v_i)
-```
-
-**Key advantage:** Doubles ASR compared to standard GCG on Llama-2/3 models
-
-**Paper results:**
-- Llama-2-7B: 40% (GCG) → **80% (REINFORCE-GCG)**
-- Llama-3-8B: 35% (GCG) → **70% (REINFORCE-GCG)**
-- Llama-3-8B + Circuit Breaker: 2% → **50%** (25× improvement!)
-
-#### GRPO (Group Relative Policy Optimization)
-Based on DeepSeek-R1's training approach:
+Original supervised fine-tuning approach with multi-objective loss:
 
 ```python
-# Relative ranking advantages
-A_i = 1.0 - (2.0 * rank_i / (K-1))  # Best = +1, worst = -1
+# 2-pass loss for harmful examples
+loss_ablate = CE(harmful_completion | α=0)  # Comply when ablated
+loss_add = CE(refusal_completion | α=1)     # Refuse when added
+loss_retain = CE(helpful_completion)         # Preserve capabilities
 
-# Policy gradient
-grad = Σ A_i · ∇log π(v_i)
-```
-
-**Key advantage:** Simpler implementation, good for relative comparisons
-
-#### Pareto Optimization (Multi-Objective)
-
-Explores the tradeoff between ASR (attack success) and capability preservation:
-
-```python
-# Multi-objective reward
-reward = λ_ASR · ASR - λ_KL · KL_divergence
-
-# Finds Pareto frontier: maximize ASR while minimizing capability damage
+loss = λ_ablate * loss_ablate + λ_add * loss_add + λ_retain * loss_retain
 ```
 
 **Usage:**
+```python
+from src.training import train_ace
+model, trainer = train_ace(..., mode='sft')
+```
+
+#### REINFORCE-RDO (RL-based)
+
+Based on ["REINFORCE Adversarial Attacks on Large Language Models"](https://arxiv.org/abs/2502.17254) (Geisler et al., 2025). Uses HarmBench classifier as reward signal:
+
+```python
+# Variance-reduced policy gradient
+w_i = R_i - mean(R)  # Baseline subtraction
+grad = Σ w_i · ∇log π(v_i)
+```
+
+**Key advantage:** Optimizes directly for ASR without needing harmful completions as targets.
+
+**Usage:**
 ```bash
-# Standard REINFORCE training with HarmBench judge
+# REINFORCE-RDO training with HarmBench judge
 modal run modal_ace_reinforce.py
 
 # Quick test (~5 min)
@@ -99,10 +88,11 @@ modal run modal_ace_reinforce.py --quick
 modal run modal_ace_reinforce.py --layer 15
 ```
 
+**Token limits (per paper):** 128 tokens during training, 512 for evaluation.
+
 **Expected results on Gemma-2-2B:**
 - Baseline (mean diff): ~70% ASR
-- After REINFORCE (100 steps): ~85% ASR (+15%)
-- KL divergence: <0.5 (low capability damage)
+- After REINFORCE-RDO (100 steps): ~85% ASR (+15%)
 
 ### Evaluation Dataset (HarmBench)
 
